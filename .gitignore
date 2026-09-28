@@ -1,0 +1,6 @@
+.build/
+dist/
+spike/yawprobe
+spike/camdiag
+spike/GazeProbe.app/
+spike/*.log

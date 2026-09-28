@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.gazevoice.app</string>
+<key>CFBundleName</key><string>GazeVoice</string>
+<key>CFBundleDisplayName</key><string>GazeVoice</string>
+<key>CFBundleExecutable</key><string>GazeVoice</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>LSUIElement</key><true/>
+<key>NSCameraUsageDescription</key><string>GazeVoice reads which way your head is turned so your dictation goes to the window you're looking at. Frames are processed in memory on this Mac and never stored.</string>
+<key>NSMicrophoneUsageDescription</key><string>GazeVoice records while you hold the talk key and transcribes it on this Mac.</string>
+<key>NSSpeechRecognitionUsageDescription</key><string>GazeVoice transcribes your dictation with on-device speech recognition.</string>
+</dict></plist>
