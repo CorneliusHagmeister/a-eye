@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var latchedRect: CGRect?
     private var frameCount = 0
     private var lastPostureHint = Date.distantPast
+    private var pupilProbe: PupilProbe?
     private let delivery = Delivery()
     private lazy var engine: SpeechEngine = Engines.make(Settings.engine) ?? Engines.make("parakeet")
         ?? Engines.make("whisper") ?? Engines.make("apple")!
@@ -52,6 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if CommandLine.arguments.contains("--gaze-fit-test") { runGazeFitTest(); return }
         if CommandLine.arguments.contains("--commands-test") { runCommandsTest(); return }
         if CommandLine.arguments.contains("--cleanup-test") { runCleanupTest(); return }
+        if CommandLine.arguments.contains("--pupil-test") { pupilProbe = PupilProbe(); pupilProbe?.run(); return }
         if let i = CommandLine.arguments.firstIndex(of: "--engine-test"), i + 2 < CommandLine.arguments.count {
             runEngineTest(CommandLine.arguments[i + 1], CommandLine.arguments[i + 2]); return
         }
