@@ -58,9 +58,19 @@ final class Recorder {
         DispatchQueue.main.asyncAfter(deadline: .now() + Settings.micWarmSeconds, execute: item)
     }
 
+    private(set) var deviceName = ""
+
     private func startEngine() throws {
         let input = engine.inputNode
-        let inFormat = input.outputFormat(forBus: 0)
+        if let dev = AudioDevices.preferredInput(), let unit = input.audioUnit {
+            var id = dev.id
+            AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                 &id, UInt32(MemoryLayout<AudioDeviceID>.size))
+            deviceName = dev.name
+        }
+        // After switching device the node's output format can still be the old device's
+        // (e.g. AirPods' 24kHz), and a tap in that format never fires — use the hardware's.
+        let inFormat = input.inputFormat(forBus: 0)
         guard inFormat.sampleRate > 0 else {
             throw NSError(domain: "mic", code: 1, userInfo: [NSLocalizedDescriptionKey: "no microphone input (permission?)"])
         }
@@ -70,7 +80,7 @@ final class Recorder {
         }
         engine.prepare()
         try engine.start()
-        Log.info("mic: started (\(Int(inFormat.sampleRate))Hz, \(inFormat.channelCount)ch)")
+        Log.info("mic: started \(deviceName) (\(Int(inFormat.sampleRate))Hz, \(inFormat.channelCount)ch)")
     }
 
     private func consume(_ buf: AVAudioPCMBuffer) {
@@ -83,6 +93,7 @@ final class Recorder {
             if fed { status.pointee = .noDataNow; return nil }
             fed = true; status.pointee = .haveData; return buf
         }
+        if let err { Log.info("mic: convert error \(err)") }
         guard err == nil, let ch = out.floatChannelData?[0] else { return }
         let samples = Array(UnsafeBufferPointer(start: ch, count: Int(out.frameLength)))
         var sum: Float = 0

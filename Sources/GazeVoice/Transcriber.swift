@@ -3,7 +3,15 @@ import Speech
 
 protocol Transcriber {
     var name: String { get }
+    /// Called on talk-key down so slow engines can warm up while you speak.
+    func prepare()
+    func shutdown()
     func transcribe(wav: URL, hints: [String]) async throws -> String
+}
+
+extension Transcriber {
+    func prepare() {}
+    func shutdown() {}
 }
 
 /// Apple's built-in recognizer, forced on-device. No download, decent quality.
@@ -46,26 +54,105 @@ final class AppleTranscriber: Transcriber {
     }
 }
 
-/// whisper.cpp CLI, if installed (`brew install whisper-cpp`) with a ggml model in
-/// ~/Library/Application Support/GazeVoice/models/.
+/// whisper.cpp (`brew install whisper-cpp`) with a ggml model in
+/// ~/Library/Application Support/GazeVoice/models/. Keeps `whisper-server` resident while
+/// you're dictating — started on key-down so the model loads while you speak — and stops it
+/// after a few idle minutes so ~1GB isn't held all day. Falls back to the one-shot CLI.
 final class WhisperTranscriber: Transcriber {
-    let binary: URL
+    let cli: URL
+    let server: URL?
     let model: URL
-    var name: String { "Whisper (\(model.deletingPathExtension().lastPathComponent))" }
+    var name: String { "Whisper (\(model.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "ggml-", with: "")))" }
+
+    private let port = 18178
+    private let idleSeconds = 300.0
+    private var process: Process?
+    private var ready: Task<Bool, Never>?
+    private var idleStop: DispatchWorkItem?
 
     init?() {
-        let bins = ["/opt/homebrew/bin/whisper-cli", "/usr/local/bin/whisper-cli"]
-        guard let bin = bins.first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
-              let model = (try? FileManager.default.contentsOfDirectory(at: Paths.models, includingPropertiesForKeys: nil))?
+        let dirs = ["/opt/homebrew/bin", "/usr/local/bin"]
+        let fm = FileManager.default
+        guard let dir = dirs.first(where: { fm.isExecutableFile(atPath: $0 + "/whisper-cli") }),
+              let model = (try? fm.contentsOfDirectory(at: Paths.models, includingPropertiesForKeys: nil))?
                 .filter({ $0.pathExtension == "bin" }).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).first
         else { return nil }
-        binary = URL(fileURLWithPath: bin)
+        cli = URL(fileURLWithPath: dir + "/whisper-cli")
+        server = fm.isExecutableFile(atPath: dir + "/whisper-server") ? URL(fileURLWithPath: dir + "/whisper-server") : nil
         self.model = model
     }
 
-    func transcribe(wav: URL, hints: [String]) async throws -> String {
+    /// Main thread. Cheap to call repeatedly.
+    func prepare() {
+        idleStop?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.shutdown() }
+        idleStop = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + idleSeconds, execute: item)
+        guard let server, process?.isRunning != true else { return }
         let p = Process()
-        p.executableURL = binary
+        p.executableURL = server
+        p.arguments = ["-m", model.path, "--host", "127.0.0.1", "--port", String(port), "-l", "auto"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { Log.info("whisper-server failed to start: \(error)"); return }
+        process = p
+        let port = port
+        let t0 = Date()
+        ready = Task.detached {
+            for _ in 0..<600 {  // up to 60s (first run compiles Metal shaders)
+                if (try? await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(port)/")!)) != nil {
+                    Log.info(String(format: "whisper-server ready in %.1fs", Date().timeIntervalSince(t0)))
+                    return true
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            return false
+        }
+        Log.info("whisper-server starting (pid \(p.processIdentifier))")
+    }
+
+    func shutdown() {
+        guard let p = process else { return }
+        if p.isRunning { p.terminate() }
+        process = nil; ready = nil
+        Log.info("whisper-server stopped (idle)")
+    }
+
+    func transcribe(wav: URL, hints: [String]) async throws -> String {
+        await MainActor.run { prepare() }
+        if let ready, await ready.value {
+            do { return clean(try await viaServer(wav: wav, hints: hints)) } catch {
+                Log.info("whisper-server request failed, using CLI: \(error)")
+            }
+        }
+        return clean(try await viaCLI(wav: wav, hints: hints))
+    }
+
+    private func viaServer(wav: URL, hints: [String]) async throws -> String {
+        let boundary = "gv-\(UUID().uuidString)"
+        var body = Data()
+        func field(_ name: String, _ value: String) {
+            body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
+        }
+        field("response_format", "text")
+        field("prompt", hints.joined(separator: ", "))
+        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
+        body.append(try Data(contentsOf: wav))
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/inference")!)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 120
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        let (data, resp) = try await URLSession.shared.upload(for: req, from: body)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            throw NSError(domain: "whisper", code: (resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func viaCLI(wav: URL, hints: [String]) async throws -> String {
+        let p = Process()
+        p.executableURL = cli
         p.arguments = ["-m", model.path, "-f", wav.path, "-nt", "-np", "-l", "auto",
                        "--prompt", hints.joined(separator: ", ")]
         let out = Pipe()
@@ -79,7 +166,10 @@ final class WhisperTranscriber: Transcriber {
                           userInfo: [NSLocalizedDescriptionKey: "whisper-cli exited \(p.terminationStatus)"])
         }
         return String(decoding: data, as: UTF8.self)
-            .replacingOccurrences(of: "[BLANK_AUDIO]", with: "")
+    }
+
+    private func clean(_ s: String) -> String {
+        s.replacingOccurrences(of: "[BLANK_AUDIO]", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

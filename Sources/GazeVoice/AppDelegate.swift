@@ -31,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let i = CommandLine.arguments.firstIndex(of: "--transcribe"), i + 1 < CommandLine.arguments.count {
             runTranscribeCLI(CommandLine.arguments[i + 1]); return
         }
+        if CommandLine.arguments.contains("--mic-test") { runMicTest(); return }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "eye", accessibilityDescription: "GazeVoice")
         statusItem.button?.imagePosition = .imageLeading
@@ -43,6 +44,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wireDispatcher()
         requestPermissions()
     }
+
+    func applicationWillTerminate(_ note: Notification) { dispatcher.transcriber.shutdown() }
 
     private static func makeTranscriber() -> Transcriber {
         if Settings.transcriber == "whisper", let w = WhisperTranscriber() { return w }
@@ -109,6 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if case .none = calMode {} else { beginCapture(); return }
         latched = store.target(classifier.current)
         latchUntil = Date().addingTimeInterval(0.4)
+        dispatcher.transcriber.prepare()
         do { try recorder.begin() } catch {
             hud.show("⚠︎ Mic: \(error.localizedDescription)", hideAfter: 3); return
         }
@@ -342,7 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(item("Press Return after pasting", #selector(toggleSubmit), on: Settings.autoSubmit))
         menu.addItem(item("Show target in menu bar", #selector(toggleMenuBar), on: Settings.showGazeInMenuBar))
-        let whisper = WhisperTranscriber()
+        let whisper = dispatcher.transcriber as? WhisperTranscriber ?? WhisperTranscriber()
         let tsub = NSMenu()
         tsub.addItem(item("Apple on-device", #selector(chooseApple), on: !(dispatcher.transcriber is WhisperTranscriber)))
         tsub.addItem(whisper.map { item($0.name, #selector(chooseWhisper), on: dispatcher.transcriber is WhisperTranscriber) }
@@ -362,7 +366,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func removeAll() { store.removeAll() }
     @objc private func toggleSubmit() { Settings.autoSubmit.toggle() }
     @objc private func toggleMenuBar() { Settings.showGazeInMenuBar.toggle(); updateStatusTitle(face: tracker.latest != nil) }
-    @objc private func chooseApple() { Settings.transcriber = "apple"; dispatcher.transcriber = AppleTranscriber() }
+    @objc private func chooseApple() {
+        dispatcher.transcriber.shutdown()
+        Settings.transcriber = "apple"; dispatcher.transcriber = AppleTranscriber()
+    }
     @objc private func chooseWhisper() {
         if let w = WhisperTranscriber() { Settings.transcriber = "whisper"; dispatcher.transcriber = w }
     }
@@ -382,20 +389,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hud.show("Copied", hideAfter: 1)
     }
 
-    // MARK: CLI test hook
+    // MARK: CLI test hooks
+
+    /// `GazeVoice --mic-test` — opens the chosen mic for 2s, logs device and peak level, exits.
+    private func runMicTest() {
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            DispatchQueue.main.async { [self] in
+                Log.info("mic permission: \(granted)")
+                Log.info("default input: \(AudioDevices.defaultInput()?.name ?? "none"); chosen: \(AudioDevices.preferredInput()?.name ?? "none")")
+                do { try recorder.begin() } catch { Log.info("mic error: \(error)"); exit(1) }
+                var peak: Float = 0
+                Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in peak = max(peak, self.recorder.level) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    self.recorder.end { samples in
+                        Log.info(String(format: "mic-test: %d samples (%.1fs), peak level %.2f", samples.count,
+                                        Double(samples.count) / Recorder.sampleRate, peak))
+                        exit(0)
+                    }
+                }
+            }
+        }
+    }
 
     /// `GazeVoice --transcribe file.wav` — transcribes and exits (for testing the speech side).
     private func runTranscribeCLI(_ path: String) {
         Task { @MainActor in
             _ = await AppleTranscriber.requestAuthorization()
             let t = Self.makeTranscriber()
-            let t0 = Date()
-            do {
-                let text = try await t.transcribe(wav: URL(fileURLWithPath: path), hints: ["Claude", "VS Code"])
-                Log.info(String(format: "[%@ %.2fs] %@", t.name, Date().timeIntervalSince(t0), text))
-            } catch {
-                Log.info("transcribe error: \(error)")
+            for run in 1...2 {  // second run shows warm (resident model) latency
+                let t0 = Date()
+                do {
+                    let text = try await t.transcribe(wav: URL(fileURLWithPath: path), hints: ["Claude", "VS Code"])
+                    Log.info(String(format: "[%@ run %d %.2fs] %@", t.name, run, Date().timeIntervalSince(t0), text))
+                } catch {
+                    Log.info("transcribe error: \(error)")
+                }
             }
+            t.shutdown()
             exit(0)
         }
     }
