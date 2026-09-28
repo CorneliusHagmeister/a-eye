@@ -37,6 +37,7 @@ enum Paths {
     static let models = support.appendingPathComponent("models")
     static let targets = support.appendingPathComponent("targets.json")
     static let history = support.appendingPathComponent("history.jsonl")
+    static let gazeModel = support.appendingPathComponent("gaze-model.json")
 }
 
 enum Settings {
@@ -44,6 +45,10 @@ enum Settings {
     static var autoSubmit: Bool {
         get { d.bool(forKey: "autoSubmit") }
         set { d.set(newValue, forKey: "autoSubmit") }
+    }
+    static var showGazePointer: Bool {
+        get { d.bool(forKey: "showGazePointer") }
+        set { d.set(newValue, forKey: "showGazePointer") }
     }
     static var showGazeInMenuBar: Bool {
         get { d.object(forKey: "showGazeInMenuBar") as? Bool ?? true }

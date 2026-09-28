@@ -145,9 +145,8 @@ enum WindowControl {
         AXUIElementSetAttributeValue(axApp, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
         AXUIElementPerformAction(ref.window, kAXRaiseAction as CFString)
         AXUIElementSetAttributeValue(ref.window, kAXMainAttribute as CFString, kCFBooleanTrue)
-        guard click else { return true }
+        guard click, let hint = t.clickPoint(in: ref.frame) else { return true }
         AX.enableElectronTree(ref.pid)
-        let hint = t.clickPoint(in: ref.frame) ?? CGPoint(x: ref.frame.midX, y: ref.frame.midY)
         try? await Task.sleep(nanoseconds: 90_000_000)  // let the raise land
         // Chat inputs move (Claude's composer sits mid-window in a new chat, at the bottom
         // once there's a conversation), so prefer the text input nearest the calibrated point.

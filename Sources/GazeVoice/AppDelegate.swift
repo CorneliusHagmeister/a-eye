@@ -9,6 +9,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let ptt = PushToTalk()
     private let hud = HUD()
     private let dot = TargetDot()
+    private let highlight = Highlight()
+    private let pointer = GazePointer()
+    private lazy var screenCal = ScreenCalibrator(hud: hud)
+    private var gazeModel = GazeModel.load()
+    /// Smoothed estimate of where you're looking (global top-left coords), screen mode only.
+    private var gazePoint: CGPoint?
+    private var latchedRect: CGRect?
+    private var frameCount = 0
     private let delivery = Delivery()
     private lazy var engine: SpeechEngine = Engines.make(Settings.engine) ?? Engines.make("parakeet")
         ?? Engines.make("whisper") ?? Engines.make("apple")!
@@ -40,6 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if CommandLine.arguments.contains("--mic-test") { runMicTest(); return }
         if CommandLine.arguments.contains("--inspect") { runInspect(); return }
+        if CommandLine.arguments.contains("--gaze-fit-test") { runGazeFitTest(); return }
         if let i = CommandLine.arguments.firstIndex(of: "--engine-test"), i + 2 < CommandLine.arguments.count {
             runEngineTest(CommandLine.arguments[i + 1], CommandLine.arguments[i + 2]); return
         }
@@ -53,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         tracker.onSample = { [weak self] s in self?.onGaze(s) }
+        screenCal.onFinish = { [weak self] m in self?.calibrationFinished(m) }
         store.onChange = { [weak self] in self?.classifier.reset() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             let w = self?.statusItem.button?.window
@@ -98,28 +108,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if Date().timeIntervalSince(Input.lastSyntheticClick) > 0.5 { self?.delivery.focusedTarget = nil }
         }
         prepareElectronTrees()
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification,
+                                                          object: nil, queue: .main) { n in
+            if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                AX.enableElectronTree(app.processIdentifier)
+            }
+        }
     }
 
     // MARK: gaze
 
     private func onGaze(_ s: GazeSample?) {
-        let cur = classifier.update(s, targets: store.targets)
-        // Grace period after key-down: your head may still be turning to the target.
-        if ptt.isHeld, Date() < latchUntil, let cur, cur != latched?.id, let t = store.target(cur) {
-            latched = t
-            press?.target = t
-            Log.info("re-latched → \(t.name)")
-            Task { await WindowControl.focus(t, click: false) }
+        screenCal.add(s)
+        frameCount += 1
+        if let model = gazeModel, let s, !screenCal.isRunning {
+            let p = model.predict(s)
+            gazePoint = gazePoint.map { CGPoint(x: $0.x + 0.5 * (p.x - $0.x), y: $0.y + 0.5 * (p.y - $0.y)) } ?? p
+            if Settings.showGazePointer, let g = gazePoint { pointer.show(at: g) }
+            // Grace period after key-down: your head may still be turning to the target.
+            if ptt.isHeld, recordingActive, Date() < latchUntil, let g = gazePoint,
+               let (t, rect) = screenTarget(at: g), rect != latchedRect {
+                latch(t, rect: rect)
+                Log.info("re-latched → \(t.name)")
+            }
+        } else if gazeModel == nil {
+            let cur = classifier.update(s, targets: store.targets)
+            if ptt.isHeld, Date() < latchUntil, let cur, cur != latched?.id, let t = store.target(cur) {
+                latched = t
+                press?.target = t
+                Log.info("re-latched → \(t.name)")
+                Task { await WindowControl.focus(t, click: false) }
+            }
         }
         if capturing, let s { captureSamples.append(s) }
-        updateStatusTitle(face: s != nil)
+        if frameCount % 4 == 0 { updateStatusTitle(face: s != nil) }
+    }
+
+    /// Screen mode: the window visible under the gaze point, and the text input in it nearest
+    /// that point (Discord's message box, one of two split panes…). No input → the window.
+    private func screenTarget(at p: CGPoint) -> (Target, CGRect)? {
+        guard let w = WindowControl.window(at: clampToScreens(p)) else { return nil }
+        AX.enableElectronTree(w.pid)
+        let app = w.app.localizedName ?? "App"
+        let title = w.title.components(separatedBy: " — ").dropFirst().first ?? String(w.title.prefix(30))
+        var t = Target(name: title.isEmpty ? app : "\(app) · \(title)", bundleID: w.app.bundleIdentifier ?? "",
+                       appName: app, windowTitle: w.title, windowFrame: w.frame, clickFraction: nil,
+                       yaw: 0, pitch: 0, spread: 0)
+        var rect = w.frame
+        if let (_, f) = WindowControl.nearestInput(to: p, in: w.window, maxDistance: 500) {
+            t.clickFraction = CGPoint(x: (f.midX - w.frame.minX) / w.frame.width, y: (f.midY - w.frame.minY) / w.frame.height)
+            rect = f
+        }
+        return (t, rect)
+    }
+
+    private func latch(_ t: Target, rect: CGRect?) {
+        latched = t
+        latchedRect = rect
+        press?.target = t
+        if let rect { highlight.show(rect) }
+        Task { await WindowControl.focus(t, click: false) }
+    }
+
+    /// Head-pose estimates can land just off the edge; pull them onto the nearest display.
+    private func clampToScreens(_ p: CGPoint) -> CGPoint {
+        let h = AX.primaryScreenHeight
+        let frames = NSScreen.screens.map { s in
+            CGRect(x: s.frame.minX, y: h - s.frame.maxY, width: s.frame.width, height: s.frame.height)
+        }
+        if frames.contains(where: { $0.contains(p) }) { return p }
+        return frames.map { f in CGPoint(x: min(max(p.x, f.minX + 1), f.maxX - 1), y: min(max(p.y, f.minY + 1), f.maxY - 1)) }
+            .min { hypot($0.x - p.x, $0.y - p.y) < hypot($1.x - p.x, $1.y - p.y) } ?? p
+    }
+
+    private func calibrationFinished(_ m: GazeModel?) {
+        guard let m else {
+            hud.show("⚠︎ Calibration failed — couldn't see your face at enough dots", hideAfter: 4); return
+        }
+        gazeModel = m
+        gazePoint = nil
+        hud.show("✓ Screen calibration done — typical error ±\(Int(m.errorPx))px. Turn on “Show gaze pointer” to check it.",
+                 hideAfter: 5)
     }
 
     private func updateStatusTitle(face: Bool) {
         guard let button = statusItem?.button else { return }
-        guard Settings.showGazeInMenuBar, !store.targets.isEmpty else { button.title = ""; return }
+        guard Settings.showGazeInMenuBar, gazeModel != nil || !store.targets.isEmpty else { button.title = ""; return }
         if !tracker.isRunning { button.title = " paused"; return }
         if !face { button.title = " –"; return }
+        if gazeModel != nil {
+            button.title = " " + short(gazePoint.flatMap { WindowControl.window(at: clampToScreens($0))?.app.localizedName } ?? "?")
+            return
+        }
         button.title = " " + short(store.target(classifier.current)?.name ?? "?")
     }
 
@@ -135,7 +215,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func keyDown() {
         if case .none = calMode {} else { beginCapture(); return }
-        latched = store.target(classifier.current)
+        if screenCal.isRunning { return }
+        latchedRect = nil
+        if gazeModel != nil {
+            latched = nil
+            if let g = gazePoint, let (t, rect) = screenTarget(at: g) { latched = t; latchedRect = rect; highlight.show(rect) }
+        } else {
+            latched = store.target(classifier.current)
+        }
         latchUntil = Date().addingTimeInterval(0.4)
         engine.prepare()
         do { try recorder.begin() } catch {
@@ -172,6 +259,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordingActive = false
         meter?.invalidate(); meter = nil
         session = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            if self?.recordingActive == false { self?.highlight.hide() }
+        }
         let sent = sentSamples
         Log.info(String(format: "talk ↑ after %.1fs", held))
         showHUD("… \(p.target?.name ?? "transcribing")\(livePartial.isEmpty ? "" : ": " + tail(livePartial))", for: p.target)
@@ -189,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordingActive = false
         meter?.invalidate(); meter = nil
         session?.cancel(); session = nil
+        highlight.hide()
         if let p = press { delivery.forget(p) }
         recorder.cancel()
         hud.hide()
@@ -296,8 +387,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Electron apps build their accessibility tree lazily and slowly the first time; ask
     /// early so the first delivery can find the text input.
     private func prepareElectronTrees() {
-        for id in Set(store.targets.map(\.bundleID)) {
-            NSRunningApplication.runningApplications(withBundleIdentifier: id).forEach { AX.enableElectronTree($0.processIdentifier) }
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            AX.enableElectronTree(app.processIdentifier)
         }
     }
 
@@ -427,12 +518,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             i.target = self; i.representedObject = obj; i.state = on ? .on : .off
             return i
         }
-        let looking = store.target(classifier.current)?.name ?? (store.targets.isEmpty ? "no targets yet" : "—")
+        let looking = gazeModel != nil
+            ? (gazePoint.flatMap { screenTarget(at: $0)?.0.name } ?? "—")
+            : (store.target(classifier.current)?.name ?? (store.targets.isEmpty ? "no targets yet" : "—"))
         menu.addItem(item("Looking at: \(looking)", nil))
+        menu.addItem(item(gazeModel == nil ? "Calibrate screens…" : "Recalibrate screens… (±\(Int(gazeModel!.errorPx))px)",
+                          #selector(calibrateScreens)))
+        if gazeModel != nil {
+            menu.addItem(item("Show gaze pointer", #selector(togglePointer), on: Settings.showGazePointer))
+            menu.addItem(item("Forget screen calibration (use pinned targets)", #selector(forgetScreenCalibration)))
+        }
         if !AX.isTrusted { menu.addItem(item("⚠︎ Grant Accessibility…", #selector(openAXSettings))) }
         menu.addItem(.separator())
 
-        for t in store.targets {
+        if gazeModel == nil, !store.targets.isEmpty { menu.addItem(item("Pinned targets:", nil)) }
+        for t in store.targets where gazeModel == nil {
             let sub = NSMenu()
             sub.addItem(item(String(format: "yaw %.0f°  pitch %.0f°  ±%.1f°", t.yaw, t.pitch, t.spread), nil))
             sub.addItem(item("Recalibrate", #selector(recalibrateOne(_:)), t.id))
@@ -440,9 +540,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let i = item(t.name, nil, on: t.id == classifier.current); i.submenu = sub
             menu.addItem(i)
         }
-        menu.addItem(item(store.targets.isEmpty ? "Set up targets…" : "Add targets…", #selector(addTargets)))
-        if store.targets.count > 1 { menu.addItem(item("Recalibrate all…", #selector(recalibrateAll))) }
-        if !store.targets.isEmpty { menu.addItem(item("Remove all targets", #selector(removeAll))) }
+        if gazeModel == nil {
+            menu.addItem(item(store.targets.isEmpty ? "Pin targets instead…" : "Add targets…", #selector(addTargets)))
+            if store.targets.count > 1 { menu.addItem(item("Recalibrate all…", #selector(recalibrateAll))) }
+            if !store.targets.isEmpty { menu.addItem(item("Remove all targets", #selector(removeAll))) }
+        }
         menu.addItem(.separator())
 
         if !delivery.recent.isEmpty {
@@ -486,6 +588,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func addTargets() { startAdding() }
+    @objc private func calibrateScreens() { guard !screenCal.isRunning else { return }; pointer.hide(); screenCal.start() }
+    @objc private func togglePointer() { Settings.showGazePointer.toggle(); if !Settings.showGazePointer { pointer.hide() } }
+    @objc private func forgetScreenCalibration() {
+        try? FileManager.default.removeItem(at: Paths.gazeModel)
+        gazeModel = nil; gazePoint = nil; pointer.hide()
+    }
     @objc private func recalibrateAll() { startRecalibrating(store.targets.map(\.id)) }
     @objc private func recalibrateOne(_ s: NSMenuItem) { if let id = s.representedObject as? UUID { startRecalibrating([id]) } }
     @objc private func removeTarget(_ s: NSMenuItem) { if let id = s.representedObject as? UUID { store.remove(id) } }
@@ -559,6 +667,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: CLI test hooks
+
+    /// `GazeVoice --gaze-fit-test` — fits the screen model on synthetic data with a known
+    /// head-pose → screen mapping plus noise, and checks the error it reports.
+    private func runGazeFitTest() {
+        var data: [(GazeSample, CGPoint)] = []
+        var rng = SystemRandomNumberGenerator()
+        func noise(_ a: Double) -> Double { Double.random(in: -a...a, using: &rng) }
+        for sx in [-1895.0, 665.0, 0.0] { for (fx, fy) in [(0.5, 0.5), (0.15, 0.2), (0.85, 0.2), (0.15, 0.8), (0.85, 0.8)] {
+            let w = sx == 0 ? 1512.0 : 2560.0, h = sx == 0 ? 949.0 : 1440.0, y0 = sx == 0 ? 33.0 : -1440.0
+            let p = CGPoint(x: sx + w * fx, y: y0 + h * fy)
+            // Truth: yaw ≈ −x/80 (deg), pitch ≈ −y/60, plus 1° of head-pose noise.
+            let s = GazeSample(yaw: -Double(p.x) / 80 + noise(1), pitch: -Double(p.y) / 60 + noise(1),
+                               faceX: 0.5 + noise(0.01), faceY: 0.5 + noise(0.01), time: 0)
+            data.append((s, p))
+        } }
+        guard let m = GazeModel.fit(data) else { Log.info("fit failed"); exit(1) }
+        let probe = GazeSample(yaw: -1000.0 / 80, pitch: 500.0 / 60, faceX: 0.5, faceY: 0.5, time: 0)
+        Log.info(String(format: "gaze-fit-test: %d pts, quadratic %@, LOO median ±%.0fpx; probe (1000,-500) → (%.0f,%.0f)",
+                        m.points, m.quadratic ? "yes" : "no", m.errorPx, m.predict(probe).x, m.predict(probe).y))
+        exit(0)
+    }
 
     /// `GazeVoice --engine-test <engine-id> file.wav` — plays a 16kHz WAV into an engine in
     /// real time (100ms chunks, like the mic) and logs every event with its timing.

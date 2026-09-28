@@ -4,6 +4,9 @@ import Vision
 struct GazeSample {
     var yaw: Double    // degrees, + = turned towards the camera's right (your left)
     var pitch: Double  // degrees
+    /// Face centre in the camera image (0…1) — where your head is, not just where it points.
+    var faceX: Double = 0.5
+    var faceY: Double = 0.5
     var time: CFTimeInterval
 }
 
@@ -23,6 +26,8 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     private var device: AVCaptureDevice?
     private var yaw: Double?
     private var pitch: Double?
+    private var faceX: Double?
+    private var faceY: Double?
     private var lastProcessed: CFTimeInterval = 0
 
     func start() {
@@ -43,7 +48,7 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         queue.async { [self] in session.stopRunning() }
         isRunning = false
         latest = nil
-        yaw = nil; pitch = nil
+        yaw = nil; pitch = nil; faceX = nil; faceY = nil
         onSample?(nil)
     }
 
@@ -89,7 +94,10 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             let a = 0.5
             yaw = yaw.map { $0 + a * (yd - $0) } ?? yd
             pitch = pitch.map { $0 + a * (pd - $0) } ?? pd
-            sample = GazeSample(yaw: yaw!, pitch: pitch!, time: now)
+            let fx = Double(face.boundingBox.midX), fy = Double(face.boundingBox.midY)
+            faceX = faceX.map { $0 + a * (fx - $0) } ?? fx
+            faceY = faceY.map { $0 + a * (fy - $0) } ?? fy
+            sample = GazeSample(yaw: yaw!, pitch: pitch!, faceX: faceX!, faceY: faceY!, time: now)
         }
         DispatchQueue.main.async { [self] in
             if let sample { latest = sample }
