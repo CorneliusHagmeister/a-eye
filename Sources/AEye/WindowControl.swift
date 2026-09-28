@@ -195,6 +195,15 @@ enum WindowControl {
 
     static func frontmostPID() -> pid_t? { NSWorkspace.shared.frontmostApplication?.processIdentifier }
 
+    /// Text of the focused input in the frontmost app, if its accessibility exposes it.
+    static func focusedText() -> String? {
+        guard let pid = frontmostPID() else { return nil }
+        var el: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute as CFString, &el) == .success,
+              let el, CFGetTypeID(el) == AXUIElementGetTypeID() else { return nil }
+        return AX.string(el as! AXUIElement, kAXValueAttribute)
+    }
+
     private static func dist(_ a: CGRect, _ b: CGRect) -> Double {
         abs(a.minX - b.minX) + abs(a.minY - b.minY) + abs(a.width - b.width) + abs(a.height - b.height)
     }
@@ -203,6 +212,19 @@ enum WindowControl {
     private static func suffix(_ title: String) -> String {
         let parts = title.components(separatedBy: " — ")
         return parts.count > 1 ? parts.dropFirst().joined(separator: " — ") : ""
+    }
+}
+
+/// Hands the pasted text to whichever app asks for it, and notes that it did.
+final class PasteProvider: NSObject, NSPasteboardItemDataProvider {
+    let text: String
+    private(set) var delivered = false
+
+    init(_ text: String) { self.text = text }
+
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
+        item.setString(text, forType: type)
+        delivered = true
     }
 }
 
@@ -238,6 +260,11 @@ enum Input {
     }
 
     /// Pastes via the clipboard, then restores what was on it.
+    ///
+    /// The text is only *promised* to the clipboard; your previous clipboard is restored once the
+    /// target app has actually fetched it. A fixed delay isn't enough: an app busy streaming a
+    /// reply can read the clipboard late, after the restore, and paste your old clipboard instead.
+    @MainActor
     static func paste(_ text: String, submit: Bool) async {
         let pb = NSPasteboard.general
         let saved: [[NSPasteboard.PasteboardType: Data]] = (pb.pasteboardItems ?? []).map { item in
@@ -245,14 +272,19 @@ enum Input {
             for t in item.types { if let v = item.data(forType: t) { d[t] = v } }
             return d
         }
+        let provider = PasteProvider(text)
+        let item = NSPasteboardItem()
+        item.setDataProvider(provider, forTypes: [.string])
         pb.clearContents()
-        pb.setString(text, forType: .string)
+        pb.writeObjects([item])
         key(9, flags: .maskCommand)  // ⌘V
-        if submit {
-            try? await Task.sleep(nanoseconds: 120_000_000)
-            key(36)  // Return
+        let t0 = Date()
+        while !provider.delivered, Date().timeIntervalSince(t0) < 1.5 {
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        if !provider.delivered { Log.info("paste: the app didn't read the clipboard within 1.5s") }
+        if submit { key(36) }  // Return, once the text is in
+        try? await Task.sleep(nanoseconds: 250_000_000)  // margin in case it reads the type twice
         pb.clearContents()
         if !saved.isEmpty {
             pb.writeObjects(saved.map { d in

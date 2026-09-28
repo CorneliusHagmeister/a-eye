@@ -108,6 +108,7 @@ final class Delivery {
                 let tail = segments[i...]
                 let count = tail.reduce(0) { $0 + $1.text.count }
                 guard count <= 3000, await deliver(nil, to: press.target) else { continue }
+                guard boxEndsWith(tail.map(\.text).joined()) else { continue }
                 for _ in 0..<count { Input.key(51) }  // ⌫ back to the start of that sentence
                 segments[i].text = text
                 await Input.paste(segments[i...].map(\.text).joined(), submit: false)
@@ -124,6 +125,7 @@ final class Delivery {
                 let common = zip(old, new).prefix { $0 == $1 }.count
                 let deletions = old.count - common
                 guard deletions <= 4000, await deliver(nil, to: press.target) else { continue }
+                guard boxEndsWith(old) else { continue }
                 for _ in 0..<deletions { Input.key(51) }
                 let insert = String(new.dropFirst(common))
                 if !insert.isEmpty { await Input.paste(insert, submit: false) }
@@ -136,7 +138,7 @@ final class Delivery {
                 guard segmentsKey == key, let last = segments.last, last.text.count <= 4000 else {
                     onCommandDone?(press, "Nothing to scratch here"); continue
                 }
-                if await deliver(nil, to: press.target) {
+                if await deliver(nil, to: press.target), boxEndsWith(last.text) {
                     for _ in 0..<last.text.count { Input.key(51) }  // ⌫ — caret is at the end of our paste
                     segments.removeLast()
                     onCommandDone?(press, "⌫ Scratched “\(last.text.trimmingCharacters(in: .whitespaces).prefix(40))”")
@@ -154,6 +156,21 @@ final class Delivery {
                 }
             }
         }
+    }
+
+    /// Before editing blind with ⌫: does the input still end with what we think we typed?
+    /// (A late paste, a sent message or your own edits make it wrong.) If its text can't be
+    /// read, trust our record.
+    @MainActor
+    private func boxEndsWith(_ expected: String) -> Bool {
+        guard let actual = WindowControl.focusedText() else { return true }
+        func norm(_ s: String) -> String { s.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
+        let ok = norm(actual).hasSuffix(norm(expected))
+        if !ok {
+            Log.info("edit skipped: input doesn't end with our text (expected …\(expected.suffix(40)), found …\(actual.suffix(40)))")
+            segments = []
+        }
+        return ok
     }
 
     @MainActor

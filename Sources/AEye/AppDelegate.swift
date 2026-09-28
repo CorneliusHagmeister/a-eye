@@ -53,6 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if CommandLine.arguments.contains("--gaze-fit-test") { runGazeFitTest(); return }
         if CommandLine.arguments.contains("--commands-test") { runCommandsTest(); return }
         if CommandLine.arguments.contains("--cleanup-test") { runCleanupTest(); return }
+        if CommandLine.arguments.contains("--clipboard-test") { runClipboardTest(); return }
         if CommandLine.arguments.contains("--pupil-test") { pupilProbe = PupilProbe(); pupilProbe?.run(); return }
         if let i = CommandLine.arguments.firstIndex(of: "--engine-test"), i + 2 < CommandLine.arguments.count {
             runEngineTest(CommandLine.arguments[i + 1], CommandLine.arguments[i + 2]); return
@@ -857,6 +858,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: CLI test hooks
+
+    /// `AEye --clipboard-test` — offers text on the clipboard the way paste does (no ⌘V) and
+    /// logs when another process reads it, then restores the previous clipboard.
+    private func runClipboardTest() {
+        let pb = NSPasteboard.general
+        let before = pb.string(forType: .string)
+        let provider = PasteProvider("A-EYE clipboard test")
+        let item = NSPasteboardItem()
+        item.setDataProvider(provider, forTypes: [.string])
+        pb.clearContents(); pb.writeObjects([item])
+        let t0 = Date()
+        Log.info("clipboard-test: offered")
+        Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { t in
+            if provider.delivered || Date().timeIntervalSince(t0) > 8 {
+                t.invalidate()
+                Log.info(String(format: "clipboard-test: delivered=%@ after %.2fs", provider.delivered ? "yes" : "no", Date().timeIntervalSince(t0)))
+                pb.clearContents(); if let before { pb.setString(before, forType: .string) }
+                exit(0)
+            }
+        }
+    }
 
     /// `AEye --cleanup-test` — sends sample dictations through OpenAI clean-up (needs the
     /// OpenAI key in the Keychain) and logs latency and output for each.
