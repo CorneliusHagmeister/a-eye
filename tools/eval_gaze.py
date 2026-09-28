@@ -10,6 +10,7 @@ same geometric screen model A-EYE uses with different eye inputs:
 Errors are leave-one-dot-out on real data, in screen points; also per held-out phase.
 
     tools/.venv/bin/python tools/eval_gaze.py [recording_dir]
+    tools/.venv/bin/python tools/eval_gaze.py --cross latest   # last two recordings against each other
 """
 import glob
 import json
@@ -59,6 +60,13 @@ def face_crop(img, bbox, scale=1.15):
 
 def load(rec_dir, models):
     rows = [json.loads(l) for l in open(os.path.join(rec_dir, "frames.jsonl"))]
+    cache_file = os.path.join(rec_dir, "learned_cache.json")
+    cache = json.load(open(cache_file)) if os.path.exists(cache_file) else {}
+    if all(m.name in cache for m in models):
+        for r in rows:
+            for m in models:
+                r[m.name] = tuple(cache[m.name][r["file"]])
+        return rows
     t0 = time.time()
     for i, r in enumerate(rows):
         img = cv2.imread(os.path.join(rec_dir, r["file"]))
@@ -67,6 +75,7 @@ def load(rec_dir, models):
             r[m.name] = m(crop)
         if i % 100 == 0:
             print(f"  {i}/{len(rows)} frames ({time.time() - t0:.0f}s)", flush=True)
+    json.dump({m.name: {r["file"]: r[m.name] for r in rows} for m in models}, open(cache_file, "w"))
     return rows
 
 
@@ -152,10 +161,71 @@ def evaluate(pts, variant, model=None):
     return float(np.median(err)), held, (gx, gy)
 
 
+def train(pts, variant, model=None):
+    """Fit on one session: gains by grid search, then least squares; keeps that session's means."""
+    tx, ty = np.array([p["dotX"] for p in pts]), np.array([p["dotY"] for p in pts])
+    mp = (np.mean([p["pupilX"] for p in pts]), np.mean([p["pupilY"] for p in pts]))
+    mm = (np.mean([p[model][0] for p in pts]), np.mean([p[model][1] for p in pts])) if model else (0, 0)
+    gains = [(gx, gy) for gx in GAINS for gy in GAINS]
+    if variant == "learned only":
+        gains += [(-gx, gy) for gx, gy in gains]
+    best = None
+    for gx, gy in gains:
+        X = design(pts, gx, gy, variant, model, mp, mm)
+        cx, cy = fit(X, tx), fit(X, ty)
+        sse = ((X @ cx - tx) ** 2 + (X @ cy - ty) ** 2).sum()
+        if best is None or sse < best[0]:
+            best = (sse, dict(gx=gx, gy=gy, cx=cx, cy=cy, mp=mp, mm=mm))
+    return best[1]
+
+
+def predict(fitted, pts, variant, model=None):
+    X = design(pts, fitted["gx"], fitted["gy"], variant, model, fitted["mp"], fitted["mm"])
+    return X @ fitted["cx"], X @ fitted["cy"]
+
+
+def cross_session(rec_a, rec_b, models):
+    """Calibrate on one recording, test on the other — does yesterday's calibration hold today?
+    '+ recentre' shifts the prediction by the mean error on the new session's screen-centre dots
+    (natural phase, first spot per display): a ~10 s quick re-check instead of recalibrating."""
+    A, B = points(load(rec_a, models), models), points(load(rec_b, models), models)
+    variants = [("head only", None), ("head + pupils", None)] + \
+               [("head + pupils + learned", m.name) for m in models]
+    print(f"\n{'variant':44} {'same session':>13} {'other session':>14} {'+ recentre':>11} {'+ 40s top-up':>13}")
+    for variant, model in variants:
+        row = []
+        for tr, te in [(A, B), (B, A)]:
+            f = train(tr, variant, model)
+            px, py = predict(f, te, variant, model)
+            tx, ty = np.array([p["dotX"] for p in te]), np.array([p["dotY"] for p in te])
+            raw = np.median(np.hypot(px - tx, py - ty))
+            centre = np.array([p["label"] == "natural" and p["step"] % 7 == 0 for p in te])
+            dx, dy = np.mean((tx - px)[centre]), np.mean((ty - py)[centre])
+            rec = np.median(np.hypot(px + dx - tx, py + dy - ty)[~centre])
+            # Top-up: old calibration plus the new session's natural phase (~40 s), tested on the
+            # new session's other phases (never seen).
+            nat = [p for p in te if p["label"] == "natural"]
+            rest = [p for p in te if p["label"] != "natural"]
+            f2 = train(tr + nat, variant, model)
+            qx, qy = predict(f2, rest, variant, model)
+            rtx, rty = np.array([p["dotX"] for p in rest]), np.array([p["dotY"] for p in rest])
+            top = np.median(np.hypot(qx - rtx, qy - rty))
+            same = evaluate(te, variant, model)[0]
+            row.append((same, raw, rec, top))
+        r = np.mean(row, axis=0)
+        name = variant + (f" [{model}]" if model else "")
+        print(f"{name:44} {r[0]:11.0f}px {r[1]:12.0f}px {r[2]:9.0f}px {r[3]:11.0f}px")
+
+
 def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "--cross":
+        recs = sorted(glob.glob(os.path.expanduser("~/Library/Application Support/A-EYE/gaze-recordings/*")))[-2:]
+        models = [LearnedGaze(p) for p in sorted(glob.glob(os.path.join(HERE, "weights", "*_gaze.onnx")))]
+        print("sessions:", [os.path.basename(r) for r in recs], "(averaged over both directions)")
+        return cross_session(recs[0], recs[1], models)
     rec = sys.argv[1] if len(sys.argv) > 1 else sorted(glob.glob(os.path.expanduser(
         "~/Library/Application Support/A-EYE/gaze-recordings/*")))[-1]
-    models = [LearnedGaze(p) for p in sorted(glob.glob(os.path.join(HERE, "weights", "*.onnx")))]
+    models = [LearnedGaze(p) for p in sorted(glob.glob(os.path.join(HERE, "weights", "*_gaze.onnx")))]
     print(f"recording: {rec}\nmodels: {[m.name for m in models]}")
     rows = load(rec, models)
     pts = points(rows, models)
