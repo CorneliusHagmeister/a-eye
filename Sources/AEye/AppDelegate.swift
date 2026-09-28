@@ -60,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let i = CommandLine.arguments.firstIndex(of: "--segment-test"), i + 1 < CommandLine.arguments.count {
             runSegmentTest(CommandLine.arguments[i + 1]); return
         }
+        installEditMenu()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "eye", accessibilityDescription: "A-EYE")
         statusItem.button?.imagePosition = .imageLeading
@@ -721,27 +722,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let id = s.representedObject as? String { _ = promptForKey(id) }
     }
 
+    /// Menu-bar-only apps have no main menu, and ⌘V/⌘C/⌘A in text fields are routed through
+    /// the Edit menu — without one, pasting into the API-key field silently does nothing.
+    private func installEditMenu() {
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        editItem.submenu = edit
+        let main = NSMenu()
+        main.addItem(NSMenuItem(title: "A-EYE", action: nil, keyEquivalent: ""))
+        main.addItem(editItem)
+        NSApp.mainMenu = main
+    }
+
     /// Asks for an API key and stores it in the Keychain. Returns true if one is saved.
     private func promptForKey(_ id: String) -> Bool {
         let name = Engines.catalog.first { $0.id == id }?.name ?? id
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "\(name) API key"
-        alert.informativeText = "Stored in your macOS Keychain and only sent to \(name)."
+        alert.informativeText = "Paste it below (⌘V), or copy it and click “Use key from clipboard”. "
+            + "Stored in your macOS Keychain and only sent to \(name)."
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
         alert.accessoryView = field
         alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Use key from clipboard")
         alert.addButton(withTitle: "Cancel")
         if Keychain.get(id) != nil { alert.addButton(withTitle: "Remove key") }
         alert.window.initialFirstResponder = field
+        func save(_ raw: String?) -> Bool {
+            let key = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty, !key.contains(" "), !key.contains("\n") else {
+                hud.show("⚠︎ That doesn't look like an API key — nothing saved", hideAfter: 3); return false
+            }
+            Keychain.set(id, key)
+            hud.show("✓ \(name) key saved to the Keychain", hideAfter: 2)
+            return true
+        }
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !key.isEmpty else { return false }
-            Keychain.set(id, key)
-            return true
-        case .alertThirdButtonReturn:
+            return save(field.stringValue)
+        case .alertSecondButtonReturn:
+            return save(NSPasteboard.general.string(forType: .string))
+        case NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertThirdButtonReturn.rawValue + 1):
             Keychain.set(id, nil)
+            hud.show("\(name) key removed", hideAfter: 2)
             return false
         default:
             return Keychain.get(id) != nil
