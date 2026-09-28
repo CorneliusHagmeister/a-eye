@@ -4,3 +4,5 @@ spike/yawprobe
 spike/camdiag
 spike/GazeProbe.app/
 spike/*.log
+tools/.venv/
+tools/weights/
