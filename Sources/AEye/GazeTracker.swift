@@ -9,11 +9,17 @@ struct GazeSample {
     var faceY: Double = 0.5
     /// Face width as a fraction of the image — shrinks as you lean back.
     var faceSize: Double = 0.2
+    /// Pupil position inside the eye outline, in eye-widths (both eyes averaged) — the eyes'
+    /// own contribution on top of where the head points. + x = looking to your left.
+    var pupilX: Double = 0
+    var pupilY: Double = 0
+    var hasEyes = false
     var time: CFTimeInterval
 }
 
-/// Webcam → Apple Vision face rectangles (rev 3 gives yaw/pitch) → smoothed head direction.
-/// Runs the camera at a low frame rate: we only need "which window", not eye-level precision.
+/// Webcam → Apple Vision: face rectangle (rev 3 gives head yaw/pitch, position, size) plus
+/// face landmarks for the pupils, at 720p so the eyes have enough pixels (~40px wide).
+/// Low frame rate: 8 fps is plenty to pick a window.
 final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     /// Called on the main queue for every processed frame; nil = no face.
     var onSample: ((GazeSample?) -> Void)?
@@ -24,6 +30,9 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     private let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "gaze.vision")
     private let request = VNDetectFaceRectanglesRequest()
+    private let landmarks = VNDetectFaceLandmarksRequest()
+    private var pupilX: Double?
+    private var pupilY: Double?
     private let handler = VNSequenceRequestHandler()
     private var device: AVCaptureDevice?
     private var yaw: Double?
@@ -51,18 +60,19 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         queue.async { [self] in session.stopRunning() }
         isRunning = false
         latest = nil
-        yaw = nil; pitch = nil; faceX = nil; faceY = nil; faceSize = nil
+        yaw = nil; pitch = nil; faceX = nil; faceY = nil; faceSize = nil; pupilX = nil; pupilY = nil
         onSample?(nil)
     }
 
     private func configure() throws {
         request.revision = VNDetectFaceRectanglesRequestRevision3
+        landmarks.revision = VNDetectFaceLandmarksRequestRevision3
         guard let dev = AVCaptureDevice.default(for: .video) else {
             throw NSError(domain: "gaze", code: 1, userInfo: [NSLocalizedDescriptionKey: "no camera"])
         }
         device = dev
         session.beginConfiguration()
-        session.sessionPreset = .cif352x288
+        session.sessionPreset = .hd1280x720
         session.addInput(try AVCaptureDeviceInput(device: dev))
         let out = AVCaptureVideoDataOutput()
         out.alwaysDiscardsLateVideoFrames = true
@@ -102,11 +112,36 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             faceY = faceY.map { $0 + a * (fy - $0) } ?? fy
             let fs = Double(face.boundingBox.width)
             faceSize = faceSize.map { $0 + a * (fs - $0) } ?? fs
-            sample = GazeSample(yaw: yaw!, pitch: pitch!, faceX: faceX!, faceY: faceY!, faceSize: faceSize!, time: now)
+            // Landmarks on the face we already found (no second detection pass).
+            landmarks.inputFaceObservations = [face]
+            try? handler.perform([landmarks], on: px, orientation: .up)
+            let size = CGSize(width: CVPixelBufferGetWidth(px), height: CVPixelBufferGetHeight(px))
+            if let lm = landmarks.results?.first?.landmarks, let p = Self.pupils(lm, imageSize: size) {
+                pupilX = pupilX.map { $0 + a * (p.x - $0) } ?? p.x
+                pupilY = pupilY.map { $0 + a * (p.y - $0) } ?? p.y
+            }  // blink / eyes not found: hold the last pupil values
+            sample = GazeSample(yaw: yaw!, pitch: pitch!, faceX: faceX!, faceY: faceY!, faceSize: faceSize!,
+                                pupilX: pupilX ?? 0, pupilY: pupilY ?? 0, hasEyes: pupilX != nil, time: now)
         }
         DispatchQueue.main.async { [self] in
             if let sample { latest = sample }
             onSample?(sample)
         }
+    }
+
+    /// Pupil offset from each eye outline's centre, in eye-widths, averaged over both eyes.
+    /// Returns nil during a blink (outline nearly flat), when the pupil landmark is unreliable.
+    static func pupils(_ lm: VNFaceLandmarks2D, imageSize: CGSize) -> (x: Double, y: Double)? {
+        func one(_ eye: VNFaceLandmarkRegion2D?, _ pupil: VNFaceLandmarkRegion2D?) -> (Double, Double)? {
+            guard let e = eye?.pointsInImage(imageSize: imageSize), e.count > 2,
+                  let p = pupil?.pointsInImage(imageSize: imageSize).first else { return nil }
+            let xs = e.map(\.x), ys = e.map(\.y)
+            let w = xs.max()! - xs.min()!, h = ys.max()! - ys.min()!
+            guard w > 4, h / w > 0.12 else { return nil }  // closed eye
+            let cx = xs.reduce(0, +) / Double(xs.count), cy = ys.reduce(0, +) / Double(ys.count)
+            return ((p.x - cx) / w, (p.y - cy) / w)
+        }
+        guard let l = one(lm.leftEye, lm.leftPupil), let r = one(lm.rightEye, lm.rightPupil) else { return nil }
+        return ((l.0 + r.0) / 2, (l.1 + r.1) / 2)
     }
 }

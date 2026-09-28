@@ -42,8 +42,8 @@ enum Paths {
     static let models = support.appendingPathComponent("models")
     static let targets = support.appendingPathComponent("targets.json")
     static let history = support.appendingPathComponent("history.jsonl")
-    static let gazeModel = support.appendingPathComponent("gaze-model-v2.json")
-    static let gazeCalibration = support.appendingPathComponent("gaze-calibration.json")
+    static let gazeModel = support.appendingPathComponent("gaze-model-v3.json")
+    static let gazeCalibration = support.appendingPathComponent("gaze-calibration-v3.json")
 }
 
 enum Settings {

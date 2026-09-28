@@ -810,40 +810,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exit(0)
     }
 
-    /// `AEye --gaze-fit-test` — simulates a person at a desk (head turns 1/1.4 of the gaze
-    /// angle, 1° pose noise), calibrates in one or two postures, then tests in an unseen one.
+    /// `AEye --gaze-fit-test` — simulates a person at a desk: the head turns 1/1.4 of the gaze
+    /// angle and the eyes do the rest, with pupil sensitivity and noise as measured by
+    /// --pupil-test (≈0.0035 eye-widths/° horizontally, 0.0013/° vertically) and 1° head-pose
+    /// noise. Calibrates, then tests: natural looking, an unseen leaned-back posture, and
+    /// eyes-only glances with the head left pointing at the laptop.
     private func runGazeFitTest() {
+        let normal = (x: 0.0, y: 12.0, z: 55.0), leanBack = (x: 0.0, y: 4.0, z: 75.0)
         var rng = SystemRandomNumberGenerator()
         func noise(_ a: Double) -> Double { Double.random(in: -a...a, using: &rng) }
         let cmPerPt = 0.024, faceCm = 15.0, g = 1.4
-        func sample(_ p: CGPoint, head: (x: Double, y: Double, z: Double)) -> GazeSample {
+        func angles(_ p: CGPoint, _ head: (x: Double, y: Double, z: Double)) -> (yaw: Double, pitch: Double) {
             let X = Double(p.x) * cmPerPt, Y = Double(p.y) * cmPerPt  // camera at the origin
-            let yaw = -atan((X - head.x) / head.z) / g * 180 / .pi + noise(1)
-            let pitch = atan((Y - head.y) / head.z) / g * 180 / .pi + noise(1)
+            return (-atan((X - head.x) / head.z) * 180 / .pi, atan((Y - head.y) / head.z) * 180 / .pi)
+        }
+        let laptopCentre = CGPoint(x: 756, y: 500)
+        func sample(_ p: CGPoint, head: (x: Double, y: Double, z: Double), glance: Bool = false,
+                    aimAt: CGPoint? = nil) -> GazeSample {
+            let gaze = angles(p, head)
+            // Where the head points: at the target (natural), or held at a fixed spot (eyes only).
+            let aim = aimAt.map { angles($0, head) } ?? (glance ? angles(laptopCentre, head) : gaze)
+            let headYaw = aim.yaw / g, headPitch = aim.pitch / g
+            let eyeYaw = gaze.yaw - headYaw, eyePitch = gaze.pitch - headPitch
             let tanH = GazeModel.tanH, tanV = GazeModel.tanV
-            return GazeSample(yaw: yaw, pitch: pitch, faceX: 0.5 - head.x / (2 * tanH * head.z),
-                              faceY: 0.5 - head.y / (2 * tanV * head.z), faceSize: faceCm / (2 * tanH * head.z), time: 0)
+            return GazeSample(yaw: headYaw + noise(1), pitch: headPitch + noise(1),
+                              faceX: 0.5 - head.x / (2 * tanH * head.z), faceY: 0.5 - head.y / (2 * tanV * head.z),
+                              faceSize: faceCm / (2 * tanH * head.z),
+                              pupilX: -0.016 + eyeYaw * 0.0035 + noise(0.005),
+                              pupilY: 0.043 - eyePitch * 0.0013 + noise(0.002), hasEyes: true, time: 0)
         }
         let screens: [CGRect] = [CGRect(x: 0, y: 33, width: 1512, height: 949),
                                  CGRect(x: -1895, y: -1440, width: 2560, height: 1440),
                                  CGRect(x: 665, y: -1440, width: 2560, height: 1440)]
-        func dots(_ spots: [(Double, Double)]) -> [CGPoint] {
-            screens.flatMap { f in spots.map { CGPoint(x: f.minX + f.width * $0.0, y: f.minY + f.height * $0.1) } }
+        func dots(_ spots: [(Double, Double)], on list: [CGRect] = screens) -> [CGPoint] {
+            list.flatMap { f in spots.map { CGPoint(x: f.minX + f.width * $0.0, y: f.minY + f.height * $0.1) } }
         }
         let full = dots([(0.5, 0.5), (0.05, 0.5), (0.95, 0.5), (0.08, 0.1), (0.92, 0.1), (0.92, 0.9), (0.08, 0.9)])
-        let short = dots([(0.5, 0.5), (0.05, 0.5), (0.95, 0.5), (0.5, 0.08), (0.5, 0.92)])
-        let normal = (x: 0.0, y: 12.0, z: 55.0), leanBack = (x: 0.0, y: 4.0, z: 75.0)
-        let test = (x: 6.0, y: 2.0, z: 80.0)  // leaned back further and shifted — never calibrated
-        let probes = dots([(0.25, 0.3), (0.75, 0.6), (0.5, 0.2), (0.3, 0.8)])
-        func report(_ name: String, _ data: [(GazeSample, CGPoint)]) {
-            guard let m = GazeModel.fit(data) else { Log.info("\(name): fit failed"); return }
-            let errs = probes.map { p -> Double in let q = m.predict(sample(p, head: test)); return hypot(q.x - p.x, q.y - p.y) }.sorted()
-            let atNormal = probes.map { p -> Double in let q = m.predict(sample(p, head: normal)); return hypot(q.x - p.x, q.y - p.y) }.sorted()
-            Log.info(String(format: "%@: gains %.1f/%.1f · error sitting normally %.0fpx · leaned back+shifted (unseen) %.0fpx",
-                            name, m.gx, m.gy, atNormal[atNormal.count / 2], errs[errs.count / 2]))
+        // Eyes-only phase: head held on each monitor's centre, eyes to four nearby dots.
+        let eyePhase: [(GazeSample, CGPoint)] = screens.flatMap { f -> [(GazeSample, CGPoint)] in
+            let c = CGPoint(x: f.midX, y: f.midY)
+            return [(0.3, 0.5), (0.7, 0.5), (0.5, 0.25), (0.5, 0.75)].map { fx, fy in
+                let p = CGPoint(x: f.minX + f.width * fx, y: f.minY + f.height * fy)
+                return (sample(p, head: normal, aimAt: c), p)
+            }
         }
-        report("1 posture ", full.map { (sample($0, head: normal), $0) })
-        report("2 postures", full.map { (sample($0, head: normal), $0) } + short.map { (sample($0, head: leanBack), $0) })
+        let short = dots([(0.5, 0.5), (0.05, 0.5), (0.95, 0.5), (0.5, 0.08), (0.5, 0.92)])
+
+        let unseen = (x: 6.0, y: 2.0, z: 80.0)
+        let probes = dots([(0.25, 0.3), (0.75, 0.6), (0.5, 0.2), (0.3, 0.8)])
+        let glances = dots([(0.15, 0.5), (0.85, 0.5), (0.5, 0.15), (0.5, 0.85)], on: [screens[0]])  // eyes only, on the laptop
+        func err(_ m: GazeModel, _ pts: [CGPoint], _ make: (CGPoint) -> GazeSample) -> Double {
+            let e = pts.map { p -> Double in let q = m.predict(make(p)); return hypot(q.x - p.x, q.y - p.y) }.sorted()
+            return e[e.count / 2]
+        }
+        // Head-only phase: eyes fixed on a dot while the head turns around it.
+        let headPhase: [(GazeSample, CGPoint)] = screens.flatMap { f -> [(GazeSample, CGPoint)] in
+            let p = CGPoint(x: f.midX, y: f.midY)
+            return [(-450.0, 0.0), (450, 0), (0, -300), (0, 300), (-300, -200), (300, 200)].map { dx, dy in
+                (sample(p, head: normal, aimAt: CGPoint(x: p.x + dx, y: p.y + dy)), p)
+            }
+        }
+        let natural = full.map { (sample($0, head: normal), $0) }
+        let lean = short.map { (sample($0, head: leanBack), $0) }
+        for (name, data) in [("natural only            ", natural),
+                             ("+ eyes-only            ", natural + eyePhase),
+                             ("+ eyes-only + head-only", natural + eyePhase + headPhase),
+                             ("full onboarding (+lean)", natural + eyePhase + headPhase + lean)] {
+            for eyes in [false, true] {
+                guard let m = GazeModel.fit(data, useEyes: eyes) else { continue }
+                Log.info(String(format: "%@ %@: natural %4.0fpx · unseen posture %4.0fpx · eyes-only glance %4.0fpx",
+                                name, eyes ? "head+eyes" : "head only",
+                                err(m, probes) { sample($0, head: normal) },
+                                err(m, probes) { sample($0, head: unseen) },
+                                err(m, glances) { sample($0, head: normal, glance: true) }))
+            }
+        }
         exit(0)
     }
 
