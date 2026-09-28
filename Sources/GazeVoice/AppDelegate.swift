@@ -40,9 +40,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         tracker.onSample = { [weak self] s in self?.onGaze(s) }
         store.onChange = { [weak self] in self?.classifier.reset() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            let w = self?.statusItem.button?.window
+            Log.info("status item frame \(w?.frame ?? .zero) visible \(w?.isVisible ?? false) on \(w?.screen?.localizedName ?? "no screen")")
+        }
         wirePushToTalk()
         wireDispatcher()
         requestPermissions()
+    }
+
+    /// Opening the app again (Finder, Spotlight, `open`) pops the menu at the mouse — the
+    /// menu bar icon can be hidden behind the notch when the menu bar is crowded.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        guard let menu = statusItem?.menu else { return false }
+        menuNeedsUpdate(menu)
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        return false
     }
 
     func applicationWillTerminate(_ note: Notification) { dispatcher.transcriber.shutdown() }
