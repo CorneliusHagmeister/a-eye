@@ -46,6 +46,11 @@ enum Settings {
         get { d.bool(forKey: "autoSubmit") }
         set { d.set(newValue, forKey: "autoSubmit") }
     }
+    /// Paste each phrase as you pause (true) or everything at once on key release (false).
+    static var pasteWhileSpeaking: Bool {
+        get { d.bool(forKey: "pasteWhileSpeaking") }
+        set { d.set(newValue, forKey: "pasteWhileSpeaking") }
+    }
     static var showGazePointer: Bool {
         get { d.bool(forKey: "showGazePointer") }
         set { d.set(newValue, forKey: "showGazePointer") }

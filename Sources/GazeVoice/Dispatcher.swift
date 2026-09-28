@@ -11,6 +11,8 @@ final class Press {
     var state = State.live
     var text = ""
     var phrases = 0
+    /// Paste-on-release: the whole text has been queued for delivery.
+    var pastedWhole = false
     var error: String?
     var wav: URL?
 

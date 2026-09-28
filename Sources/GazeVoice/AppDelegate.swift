@@ -302,7 +302,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             p.text += text
             p.phrases += 1
             if p === press { livePartial = "" }
-            delivery.enqueue(.text(text, p))
+            // Default: hold everything until release, so nothing half-finished lands in the input.
+            if Settings.pasteWhileSpeaking { delivery.enqueue(.text(text, p)) }
         case .failed(let msg):
             p.error = msg
             Log.info("engine error: \(msg)")
@@ -321,6 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let text = try? await local.transcribe(wav: wav, hints: self.sessionContext().hints, previous: ""),
                    !ChunkedSession.clean(text).isEmpty {
                     p.text = ChunkedSession.clean(text); p.phrases = 1
+                    p.pastedWhole = true
                     self.delivery.enqueue(.text(p.text, p))
                 }
                 self.completePress(p)
@@ -331,6 +333,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func completePress(_ p: Press) {
+        if !Settings.pasteWhileSpeaking, p.phrases > 0, !p.pastedWhole {
+            p.pastedWhole = true
+            delivery.enqueue(.text(p.text, p))
+        }
         if Settings.autoSubmit, p.phrases > 0 { delivery.enqueue(.submit(p)) }
         if p.state == .undeliverable {
             NSPasteboard.general.clearContents()
@@ -356,7 +362,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func showRecordingHUD() {
         let bars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇"]
         let lvl = bars[min(bars.count - 1, Int(recorder.level * Float(bars.count)))]
-        let live = livePartial.isEmpty ? "" : "  " + tail(livePartial)
+        let running = [press?.text ?? "", livePartial].filter { !$0.isEmpty }.joined(separator: " ")
+        let live = running.isEmpty ? "" : "  " + tail(running)
         showHUD("● \(latched?.name ?? "focused app")  \(lvl)\(live)", for: latched)
     }
 
@@ -564,6 +571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(r)
         }
         menu.addItem(item("Press Return after pasting", #selector(toggleSubmit), on: Settings.autoSubmit))
+        menu.addItem(item("Paste while speaking (at each pause)", #selector(togglePasteWhileSpeaking), on: Settings.pasteWhileSpeaking))
         menu.addItem(item("Show target in menu bar", #selector(toggleMenuBar), on: Settings.showGazeInMenuBar))
 
         let esub = NSMenu()
@@ -599,6 +607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func removeTarget(_ s: NSMenuItem) { if let id = s.representedObject as? UUID { store.remove(id) } }
     @objc private func removeAll() { store.removeAll() }
     @objc private func toggleSubmit() { Settings.autoSubmit.toggle() }
+    @objc private func togglePasteWhileSpeaking() { Settings.pasteWhileSpeaking.toggle() }
     @objc private func toggleMenuBar() { Settings.showGazeInMenuBar.toggle(); updateStatusTitle(face: tracker.latest != nil) }
     @objc private func chooseEngine(_ s: NSMenuItem) {
         guard let id = s.representedObject as? String, let e = Engines.make(id) else { return }
