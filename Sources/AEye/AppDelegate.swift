@@ -197,8 +197,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         gazeModel = m
         gazePoint = nil
         let postures = m.hzMax / max(m.hzMin, 0.01) > 1.15 ? "several postures" : "one posture — add one leaning back for robustness"
-        hud.show("✓ Calibrated (\(postures)) — typical error ±\(Int(m.errorPx))px. “Show gaze pointer” to check it.",
+        hud.show("✓ Calibrated (\(postures), eyes \(m.eyes ? "on" : "off")) — typical error ±\(Int(m.errorPx))px. “Show gaze pointer” to check it.",
                  hideAfter: 6)
+        if let r = screenCal.postureReport {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.5) { [weak self] in self?.hud.show("Robustness — \(r)", hideAfter: 8) }
+        }
     }
 
     private func updateStatusTitle(face: Bool) {
@@ -817,6 +820,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// eyes-only glances with the head left pointing at the laptop.
     private func runGazeFitTest() {
         let normal = (x: 0.0, y: 12.0, z: 55.0), leanBack = (x: 0.0, y: 4.0, z: 75.0)
+        let straight = (x: 0.0, y: 16.0, z: 47.0), littleBack = (x: 0.0, y: 8.0, z: 64.0), allBack = (x: 1.0, y: 0.0, z: 88.0)
         var rng = SystemRandomNumberGenerator()
         func noise(_ a: Double) -> Double { Double.random(in: -a...a, using: &rng) }
         let cmPerPt = 0.024, faceCm = 15.0, g = 1.4
@@ -872,10 +876,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let natural = full.map { (sample($0, head: normal), $0) }
         let lean = short.map { (sample($0, head: leanBack), $0) }
+        let postureDots = dots([(0.5, 0.5), (0.05, 0.5), (0.95, 0.5), (0.5, 0.1)])
+        let postures = [straight, littleBack, allBack].flatMap { h in postureDots.map { (sample($0, head: h), $0) } }
+        if CommandLine.arguments.contains("--postures") {
+            // Average of 20 calibrations; tests postures between, beyond and beside the calibrated ones.
+            let tests: [(String, (x: Double, y: Double, z: Double))] = [
+                ("between (z60)", (0, 10, 60)), ("between (z75)", (0, 5, 75)),
+                ("beyond (z95)", (0, -3, 95)), ("shifted 8cm", (8, 10, 60))]
+            for (name, build) in [("1 lean pass ", { natural + eyePhase + headPhase + short.map { (sample($0, head: leanBack), $0) } }),
+                                  ("3 postures  ", { natural + eyePhase + headPhase + [straight, littleBack, allBack].flatMap { h in postureDots.map { (sample($0, head: h), $0) } } })] as [(String, () -> [(GazeSample, CGPoint)])] {
+                var sums = [Double](repeating: 0, count: tests.count)
+                for _ in 0..<20 {
+                    guard let m = GazeModel.fit(build()) else { continue }
+                    for (i, t) in tests.enumerated() { sums[i] += err(m, probes) { sample($0, head: t.1) } / 20 }
+                }
+                Log.info("\(name): " + zip(tests, sums).map { String(format: "%@ %3.0fpx", $0.0.0, $0.1) }.joined(separator: " · "))
+            }
+            exit(0)
+        }
         for (name, data) in [("natural only            ", natural),
                              ("+ eyes-only            ", natural + eyePhase),
                              ("+ eyes-only + head-only", natural + eyePhase + headPhase),
-                             ("full onboarding (+lean)", natural + eyePhase + headPhase + lean)] {
+                             ("old onboarding (+1 lean)", natural + eyePhase + headPhase + lean),
+                             ("new onboarding (3 postures)", natural + eyePhase + headPhase + postures)] {
             for eyes in [false, true] {
                 guard let m = GazeModel.fit(data, useEyes: eyes) else { continue }
                 Log.info(String(format: "%@ %@: natural %4.0fpx · unseen posture %4.0fpx · eyes-only glance %4.0fpx",

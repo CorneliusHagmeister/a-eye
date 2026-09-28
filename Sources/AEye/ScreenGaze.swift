@@ -171,7 +171,8 @@ enum CalibrationData {
 ///   1. Look naturally — 7 dots per monitor
 ///   2. Eyes only — head kept on the orange ring at the monitor centre, eyes follow 4 dots
 ///   3. Head only — eyes stay on a dot while the head slowly turns around it
-///   4. Leaned back — 5 dots per monitor, looking naturally
+///   4–6. Postures — sitting up straight, leaning back a little, leaning back all the way;
+///        4 dots per monitor each, looking naturally (so distance changes are learned, not guessed)
 /// "Add a posture" runs just a short natural pass in whatever posture you're in.
 final class ScreenCalibrator {
     var onFinish: ((GazeModel?) -> Void)?
@@ -187,6 +188,7 @@ final class ScreenCalibrator {
     private var collecting = false
     private var samples: [GazeSample] = []
     private var data: [(GazeSample, CGPoint)] = []
+    private var labels: [String] = []  // which step kind each data point came from
     private var cancelled = false
     private var appending = false
     private var escMonitor: Any?
@@ -214,7 +216,7 @@ final class ScreenCalibrator {
                             intro: "New posture: sit the way you want to add, then look at each dot naturally", label: "posture")
         } else {
             steps = natural([(0.5, 0.5), (0.05, 0.5), (0.95, 0.5), (0.08, 0.1), (0.92, 0.1), (0.92, 0.9), (0.08, 0.9)],
-                            intro: "1/4 · Look at each red dot the way you normally would", label: "natural")
+                            intro: "1/6 · Look at each red dot the way you normally would", label: "natural")
             var eyes: [Step] = []
             for sc in screens {
                 let c = at(sc, 0.5, 0.5)
@@ -222,14 +224,17 @@ final class ScreenCalibrator {
                     eyes.append(Step(point: at(sc, fx, fy), kind: .eyesOnly(anchor: c), intro: nil, label: "eyes only"))
                 }
             }
-            eyes[0].intro = "2/4 · EYES ONLY: keep your nose pointed at the orange ring, follow the red dot with just your eyes"
+            eyes[0].intro = "2/6 · EYES ONLY: keep your nose pointed at the orange ring, follow the red dot with just your eyes"
             var head = screens.map { Step(point: at($0, 0.5, 0.5), kind: .headTurn, intro: nil, label: "head only") }
-            head[0].intro = "3/4 · HEAD ONLY: keep your eyes on the red dot and slowly turn your head left, right, up and down"
-            let lean = natural([(0.5, 0.5), (0.05, 0.5), (0.95, 0.5), (0.5, 0.08), (0.5, 0.92)],
-                               intro: "4/4 · Now LEAN BACK the way you do when relaxed, and look at each dot naturally", label: "leaned back")
-            steps = steps + eyes + head + lean
+            head[0].intro = "3/6 · HEAD ONLY: keep your eyes on the red dot and slowly turn your head left, right, up and down"
+            let postureSpots = [(0.5, 0.5), (0.05, 0.5), (0.95, 0.5), (0.5, 0.1)]
+            let postures = natural(postureSpots, intro: "4/6 · SIT UP VERY STRAIGHT (or lean a little forward) and look at each dot naturally",
+                                   label: "sitting straight")
+                + natural(postureSpots, intro: "5/6 · LEAN BACK A LITTLE and look at each dot naturally", label: "leaned back a little")
+                + natural(postureSpots, intro: "6/6 · LEAN BACK ALL THE WAY, as relaxed as you sit, and look at each dot", label: "leaned right back")
+            steps = steps + eyes + head + postures
         }
-        index = 0; data = []; cancelled = false
+        index = 0; data = []; labels = []; cancelled = false
         escMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] e in
             if e.keyCode == 53 { self?.cancel() }
         }
@@ -273,10 +278,10 @@ final class ScreenCalibrator {
                     // The head sweeps while the eyes hold: each half-second is its own data point.
                     for chunk in stride(from: 0, to: self.samples.count - 2, by: 4) {
                         let window = Array(self.samples[chunk..<min(chunk + 4, self.samples.count)])
-                        if let m = Self.median(window) { self.data.append((m, step.point)) }
+                        if let m = Self.median(window) { self.data.append((m, step.point)); self.labels.append(step.label) }
                     }
                 } else if let m = Self.median(self.samples) {
-                    self.data.append((m, step.point))
+                    self.data.append((m, step.point)); self.labels.append(step.label)
                 } else {
                     Log.info("calibration: no face at step \(self.index + 1), skipped")
                 }
@@ -308,7 +313,28 @@ final class ScreenCalibrator {
         if model?.eyes == true, let headOnly = GazeModel.fit(all, useEyes: false) {
             Log.info(String(format: "calibration: head-only would be ±%.0fpx", headOnly.errorPx))
         }
+        postureReport = appending ? nil : heldOutPostures()
         onFinish?(model)
+    }
+
+    /// Real-data check of posture robustness: for each posture pass, fit on everything else and
+    /// measure the error on that posture's dots — "would it cope if I'd never calibrated this?"
+    private(set) var postureReport: String?
+
+    private func heldOutPostures() -> String? {
+        var parts: [String] = []
+        for label in ["sitting straight", "leaned back a little", "leaned right back", "eyes only"] {
+            let held = data.indices.filter { labels[$0] == label }
+            guard held.count >= 3 else { continue }
+            let rest = data.indices.filter { labels[$0] != label }.map { data[$0] }
+            guard let m = GazeModel.fit(rest) else { continue }
+            let errs = held.map { i -> Double in let p = m.predict(data[i].0); return hypot(p.x - data[i].1.x, p.y - data[i].1.y) }.sorted()
+            parts.append(String(format: "%@ %.0fpx", label, errs[errs.count / 2]))
+        }
+        guard !parts.isEmpty else { return nil }
+        let report = "if never calibrated: " + parts.joined(separator: " · ")
+        Log.info("calibration: " + report)
+        return report
     }
 
     func cancel() {
