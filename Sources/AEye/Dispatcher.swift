@@ -110,8 +110,10 @@ final class Delivery {
                 guard count <= 3000, await deliver(nil, to: press.target) else { continue }
                 guard boxEndsWith(tail.map(\.text).joined()) else { continue }
                 for _ in 0..<count { Input.key(51) }  // ⌫ back to the start of that sentence
-                segments[i].text = text
-                await Input.paste(segments[i...].map(\.text).joined(), submit: false)
+                let retype = [text] + tail.dropFirst().map(\.text)
+                await Input.paste(retype.joined(), submit: false)
+                // Awaits above can see segments reset (you typed/clicked): look it up again.
+                if let j = segments.firstIndex(where: { $0.id == id }) { segments[j].text = text }
             case .rewrite(let press, let newText):
                 let key = press.target?.key ?? "front"
                 guard segmentsKey == key, focusedTarget == key || press.target == nil,
@@ -129,7 +131,11 @@ final class Delivery {
                 for _ in 0..<deletions { Input.key(51) }
                 let insert = String(new.dropFirst(common))
                 if !insert.isEmpty { await Input.paste(insert, submit: false) }
-                segments.replaceSubrange(first...last, with: [(UUID(), press.id, lead + newText)])
+                // Awaits above can see segments reset (you typed/clicked): look them up again.
+                if let f = segments.firstIndex(where: { $0.press == press.id }),
+                   let l = segments.lastIndex(where: { $0.press == press.id }) {
+                    segments.replaceSubrange(f...l, with: [(UUID(), press.id, lead + newText)])
+                }
             case .submit(let press):
                 if press.state != .undeliverable { _ = await deliver(nil, to: press.target, submit: true) }
                 segments = []
@@ -140,7 +146,7 @@ final class Delivery {
                 }
                 if await deliver(nil, to: press.target), boxEndsWith(last.text) {
                     for _ in 0..<last.text.count { Input.key(51) }  // ⌫ — caret is at the end of our paste
-                    segments.removeLast()
+                    if segments.last?.id == last.id { segments.removeLast() }
                     onCommandDone?(press, "⌫ Scratched “\(last.text.trimmingCharacters(in: .whitespaces).prefix(40))”")
                 }
             case .clear(let press):
