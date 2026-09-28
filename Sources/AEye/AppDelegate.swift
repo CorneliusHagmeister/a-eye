@@ -199,16 +199,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Log.info("gaze test set: \(rec.close()) frames in \(rec.dir.path)")
         }
         guard let m else {
-            hud.show("⚠︎ Calibration failed — couldn't see your face at enough dots", hideAfter: 4); return
+            return  // the calibration stage shows the failure card
         }
         gazeModel = m
         gazePoint = nil
-        let postures = m.hzMax / max(m.hzMin, 0.01) > 1.15 ? "several postures" : "one posture — add one leaning back for robustness"
-        hud.show("✓ Calibrated (\(postures), eyes \(m.eyes ? "on" : "off")) — typical error ±\(Int(m.errorPx))px. “Show gaze pointer” to check it.",
-                 hideAfter: 6)
-        if let r = screenCal.postureReport {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 6.5) { [weak self] in self?.hud.show("Robustness — \(r)", hideAfter: 8) }
-        }
+        // The calibration stage shows the results card.
     }
 
     private func updateStatusTitle(face: Bool) {
