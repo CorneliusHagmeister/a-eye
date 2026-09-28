@@ -402,6 +402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Waits until the rolling clean-up has covered everything said in this press.
+    @MainActor
     private func settleRewrites(_ p: Press) async {
         while true {
             let pending = p.cleanups
@@ -443,6 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task { @MainActor in await self.completePressAsync(p) }
     }
 
+    @MainActor
     private func completePressAsync(_ p: Press) async {
         var submit = (Settings.autoSubmit || p.submitRequested) && !p.text.isEmpty
         if !Settings.pasteWhileSpeaking, p.phrases > 0, !p.pastedWhole {
