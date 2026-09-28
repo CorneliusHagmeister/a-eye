@@ -10,7 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let hud = HUD()
     private let dot = TargetDot()
     private let delivery = Delivery()
-    private lazy var engine: SpeechEngine = Engines.make(Settings.engine) ?? Engines.make("whisper") ?? Engines.make("apple")!
+    private lazy var engine: SpeechEngine = Engines.make(Settings.engine) ?? Engines.make("parakeet")
+        ?? Engines.make("whisper") ?? Engines.make("apple")!
     private var statusItem: NSStatusItem!
 
     // Recording state
@@ -583,7 +584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             s.append(Array(all[i..<j])); i = j
             if i >= all.count { t.invalidate(); Log.info("\(stamp()) audio end"); s.finish() }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { Log.info("engine-test timeout"); exit(1) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300) { Log.info("engine-test timeout"); exit(1) }
     }
 
     /// `GazeVoice --segment-test file.wav` — replays a 16kHz 16-bit WAV as if live and logs

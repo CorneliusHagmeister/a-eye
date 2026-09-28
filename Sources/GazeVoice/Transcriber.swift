@@ -11,6 +11,7 @@ protocol Transcriber: AnyObject {
     func shutdown()
     /// `previous` is the text of the phrase before this one, for continuity.
     func transcribe(wav: URL, hints: [String], previous: String) async throws -> String
+    func transcribe(samples: [Float], hints: [String], previous: String) async throws -> String
 }
 
 extension Transcriber {

@@ -60,12 +60,21 @@ enum Engines {
         case "wispr": return ChunkedEngine(id: id, transcriber: WisprTranscriber())
         case "deepgram": return DeepgramEngine()
         case "openai": return OpenAIEngine()
-        default: return nil  // parakeet: needs the Swift 6 toolchain (FluidAudio)
+        #if canImport(FluidAudio)
+        case "parakeet": return ChunkedEngine(id: id, transcriber: ParakeetTranscriber())
+        #endif
+        default: return nil  // parakeet without FluidAudio (needs a Swift 6 toolchain)
         }
     }
 
     /// Always-available local transcriber: fallback when a cloud engine fails, and for retries.
-    static func localTranscriber() -> Transcriber { WhisperTranscriber() ?? AppleTranscriber() }
+    static func localTranscriber() -> Transcriber {
+        #if canImport(FluidAudio)
+        return ParakeetTranscriber()
+        #else
+        return WhisperTranscriber() ?? AppleTranscriber()
+        #endif
+    }
 }
 
 /// Turns any clip-at-a-time transcriber (local Whisper, Parakeet, Wispr Flow's REST API) into

@@ -51,7 +51,7 @@ enum Settings {
     }
     /// Speech engine id (see `Engines.catalog`).
     static var engine: String {
-        get { d.string(forKey: "engine") ?? "whisper" }
+        get { d.string(forKey: "engine") ?? "parakeet" }
         set { d.set(newValue, forKey: "engine") }
     }
     /// Languages you dictate in (ISO 639-1). Cloud engines use it to skip/limit detection.

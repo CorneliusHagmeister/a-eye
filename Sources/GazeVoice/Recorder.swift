@@ -123,6 +123,13 @@ final class Recorder {
 }
 
 enum WAV {
+    /// Reads the 16-bit mono WAVs written by `write`.
+    static func read(_ url: URL) throws -> [Float] {
+        let data = try Data(contentsOf: url)
+        guard data.count > 44 else { return [] }
+        return data.dropFirst(44).withUnsafeBytes { $0.bindMemory(to: Int16.self).map { Float($0) / 32767 } }
+    }
+
     /// 16-bit PCM mono — the format whisper.cpp and everything else reads.
     static func write(_ samples: [Float], sampleRate: Int = 16_000, to url: URL) throws {
         var data = Data()
