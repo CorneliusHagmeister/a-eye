@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var gazePoint: CGPoint?
     private var latchedRect: CGRect?
     private var frameCount = 0
+    private var lastPostureHint = Date.distantPast
     private let delivery = Delivery()
     private lazy var engine: SpeechEngine = Engines.make(Settings.engine) ?? Engines.make("parakeet")
         ?? Engines.make("whisper") ?? Engines.make("apple")!
@@ -188,8 +189,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         gazeModel = m
         gazePoint = nil
-        hud.show("✓ Screen calibration done — typical error ±\(Int(m.errorPx))px. Turn on “Show gaze pointer” to check it.",
-                 hideAfter: 5)
+        let postures = m.hzMax / max(m.hzMin, 0.01) > 1.15 ? "several postures" : "one posture — add one leaning back for robustness"
+        hud.show("✓ Calibrated (\(postures)) — typical error ±\(Int(m.errorPx))px. “Show gaze pointer” to check it.",
+                 hideAfter: 6)
     }
 
     private func updateStatusTitle(face: Bool) {
@@ -221,6 +223,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if gazeModel != nil {
             latched = nil
             if let g = gazePoint, let (t, rect) = screenTarget(at: g) { latched = t; latchedRect = rect; highlight.show(rect) }
+            if let s = tracker.latest, gazeModel!.isOutsideCalibratedPosture(s), Date().timeIntervalSince(lastPostureHint) > 300 {
+                lastPostureHint = Date()
+                Log.info("posture outside calibration (distance \(GazeModel.distance(s)))")
+                hud.show("You're sitting differently from calibration — menu › Add a posture helps", hideAfter: 3)
+            }
         } else {
             latched = store.target(classifier.current)
         }
@@ -551,6 +558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item(gazeModel == nil ? "Calibrate screens…" : "Recalibrate screens… (±\(Int(gazeModel!.errorPx))px)",
                           #selector(calibrateScreens)))
         if gazeModel != nil {
+            menu.addItem(item("Add a posture (e.g. leaning back)…", #selector(addPosture)))
             menu.addItem(item("Show gaze pointer", #selector(togglePointer), on: Settings.showGazePointer))
             menu.addItem(item("Forget screen calibration (use pinned targets)", #selector(forgetScreenCalibration)))
         }
@@ -616,9 +624,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func addTargets() { startAdding() }
     @objc private func calibrateScreens() { guard !screenCal.isRunning else { return }; pointer.hide(); screenCal.start() }
+    @objc private func addPosture() { guard !screenCal.isRunning else { return }; pointer.hide(); screenCal.start(addPosture: true) }
     @objc private func togglePointer() { Settings.showGazePointer.toggle(); if !Settings.showGazePointer { pointer.hide() } }
     @objc private func forgetScreenCalibration() {
         try? FileManager.default.removeItem(at: Paths.gazeModel)
+        try? FileManager.default.removeItem(at: Paths.gazeCalibration)
         gazeModel = nil; gazePoint = nil; pointer.hide()
     }
     @objc private func recalibrateAll() { startRecalibrating(store.targets.map(\.id)) }
@@ -714,24 +724,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exit(0)
     }
 
-    /// `GazeVoice --gaze-fit-test` — fits the screen model on synthetic data with a known
-    /// head-pose → screen mapping plus noise, and checks the error it reports.
+    /// `GazeVoice --gaze-fit-test` — simulates a person at a desk (head turns 1/1.4 of the gaze
+    /// angle, 1° pose noise), calibrates in one or two postures, then tests in an unseen one.
     private func runGazeFitTest() {
-        var data: [(GazeSample, CGPoint)] = []
         var rng = SystemRandomNumberGenerator()
         func noise(_ a: Double) -> Double { Double.random(in: -a...a, using: &rng) }
-        for sx in [-1895.0, 665.0, 0.0] { for (fx, fy) in [(0.5, 0.5), (0.15, 0.2), (0.85, 0.2), (0.15, 0.8), (0.85, 0.8)] {
-            let w = sx == 0 ? 1512.0 : 2560.0, h = sx == 0 ? 949.0 : 1440.0, y0 = sx == 0 ? 33.0 : -1440.0
-            let p = CGPoint(x: sx + w * fx, y: y0 + h * fy)
-            // Truth: yaw ≈ −x/80 (deg), pitch ≈ −y/60, plus 1° of head-pose noise.
-            let s = GazeSample(yaw: -Double(p.x) / 80 + noise(1), pitch: -Double(p.y) / 60 + noise(1),
-                               faceX: 0.5 + noise(0.01), faceY: 0.5 + noise(0.01), time: 0)
-            data.append((s, p))
-        } }
-        guard let m = GazeModel.fit(data) else { Log.info("fit failed"); exit(1) }
-        let probe = GazeSample(yaw: -1000.0 / 80, pitch: 500.0 / 60, faceX: 0.5, faceY: 0.5, time: 0)
-        Log.info(String(format: "gaze-fit-test: %d pts, quadratic %@, LOO median ±%.0fpx; probe (1000,-500) → (%.0f,%.0f)",
-                        m.points, m.quadratic ? "yes" : "no", m.errorPx, m.predict(probe).x, m.predict(probe).y))
+        let cmPerPt = 0.024, faceCm = 15.0, g = 1.4
+        func sample(_ p: CGPoint, head: (x: Double, y: Double, z: Double)) -> GazeSample {
+            let X = Double(p.x) * cmPerPt, Y = Double(p.y) * cmPerPt  // camera at the origin
+            let yaw = -atan((X - head.x) / head.z) / g * 180 / .pi + noise(1)
+            let pitch = atan((Y - head.y) / head.z) / g * 180 / .pi + noise(1)
+            let tanH = GazeModel.tanH, tanV = GazeModel.tanV
+            return GazeSample(yaw: yaw, pitch: pitch, faceX: 0.5 - head.x / (2 * tanH * head.z),
+                              faceY: 0.5 - head.y / (2 * tanV * head.z), faceSize: faceCm / (2 * tanH * head.z), time: 0)
+        }
+        let screens: [CGRect] = [CGRect(x: 0, y: 33, width: 1512, height: 949),
+                                 CGRect(x: -1895, y: -1440, width: 2560, height: 1440),
+                                 CGRect(x: 665, y: -1440, width: 2560, height: 1440)]
+        func dots(_ spots: [(Double, Double)]) -> [CGPoint] {
+            screens.flatMap { f in spots.map { CGPoint(x: f.minX + f.width * $0.0, y: f.minY + f.height * $0.1) } }
+        }
+        let full = dots([(0.5, 0.5), (0.05, 0.5), (0.95, 0.5), (0.08, 0.1), (0.92, 0.1), (0.92, 0.9), (0.08, 0.9)])
+        let short = dots([(0.5, 0.5), (0.05, 0.5), (0.95, 0.5), (0.5, 0.08), (0.5, 0.92)])
+        let normal = (x: 0.0, y: 12.0, z: 55.0), leanBack = (x: 0.0, y: 4.0, z: 75.0)
+        let test = (x: 6.0, y: 2.0, z: 80.0)  // leaned back further and shifted — never calibrated
+        let probes = dots([(0.25, 0.3), (0.75, 0.6), (0.5, 0.2), (0.3, 0.8)])
+        func report(_ name: String, _ data: [(GazeSample, CGPoint)]) {
+            guard let m = GazeModel.fit(data) else { Log.info("\(name): fit failed"); return }
+            let errs = probes.map { p -> Double in let q = m.predict(sample(p, head: test)); return hypot(q.x - p.x, q.y - p.y) }.sorted()
+            let atNormal = probes.map { p -> Double in let q = m.predict(sample(p, head: normal)); return hypot(q.x - p.x, q.y - p.y) }.sorted()
+            Log.info(String(format: "%@: gains %.1f/%.1f · error sitting normally %.0fpx · leaned back+shifted (unseen) %.0fpx",
+                            name, m.gx, m.gy, atNormal[atNormal.count / 2], errs[errs.count / 2]))
+        }
+        report("1 posture ", full.map { (sample($0, head: normal), $0) })
+        report("2 postures", full.map { (sample($0, head: normal), $0) } + short.map { (sample($0, head: leanBack), $0) })
         exit(0)
     }
 

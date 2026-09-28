@@ -7,6 +7,8 @@ struct GazeSample {
     /// Face centre in the camera image (0…1) — where your head is, not just where it points.
     var faceX: Double = 0.5
     var faceY: Double = 0.5
+    /// Face width as a fraction of the image — shrinks as you lean back.
+    var faceSize: Double = 0.2
     var time: CFTimeInterval
 }
 
@@ -28,6 +30,7 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     private var pitch: Double?
     private var faceX: Double?
     private var faceY: Double?
+    private var faceSize: Double?
     private var lastProcessed: CFTimeInterval = 0
 
     func start() {
@@ -48,7 +51,7 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         queue.async { [self] in session.stopRunning() }
         isRunning = false
         latest = nil
-        yaw = nil; pitch = nil; faceX = nil; faceY = nil
+        yaw = nil; pitch = nil; faceX = nil; faceY = nil; faceSize = nil
         onSample?(nil)
     }
 
@@ -97,7 +100,9 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             let fx = Double(face.boundingBox.midX), fy = Double(face.boundingBox.midY)
             faceX = faceX.map { $0 + a * (fx - $0) } ?? fx
             faceY = faceY.map { $0 + a * (fy - $0) } ?? fy
-            sample = GazeSample(yaw: yaw!, pitch: pitch!, faceX: faceX!, faceY: faceY!, time: now)
+            let fs = Double(face.boundingBox.width)
+            faceSize = faceSize.map { $0 + a * (fs - $0) } ?? fs
+            sample = GazeSample(yaw: yaw!, pitch: pitch!, faceX: faceX!, faceY: faceY!, faceSize: faceSize!, time: now)
         }
         DispatchQueue.main.async { [self] in
             if let sample { latest = sample }
