@@ -193,6 +193,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func calibrationFinished(_ m: GazeModel?) {
+        if let rec = screenCal.recorder {
+            tracker.frameTap = nil
+            screenCal.recorder = nil
+            Log.info("gaze test set: \(rec.close()) frames in \(rec.dir.path)")
+        }
         guard let m else {
             hud.show("⚠︎ Calibration failed — couldn't see your face at enough dots", hideAfter: 4); return
         }
@@ -672,6 +677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                           #selector(calibrateScreens)))
         if gazeModel != nil {
             menu.addItem(item("Add a posture (e.g. leaning back)…", #selector(addPosture)))
+            menu.addItem(item("Record gaze test set (3 min, saves frames)…", #selector(recordGazeSet)))
             menu.addItem(item("Show gaze pointer", #selector(togglePointer), on: Settings.showGazePointer))
             menu.addItem(item("Forget screen calibration (use pinned targets)", #selector(forgetScreenCalibration)))
         }
@@ -745,6 +751,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func addTargets() { startAdding() }
     @objc private func calibrateScreens() { guard !screenCal.isRunning else { return }; pointer.hide(); screenCal.start() }
+    @objc private func recordGazeSet() {
+        guard !screenCal.isRunning, let rec = GazeRecorder() else { return }
+        pointer.hide()
+        screenCal.recorder = rec
+        tracker.frameTap = { px, face, s in rec.frame(px, face: face, sample: s) }
+        screenCal.start()
+        Log.info("recording gaze test set to \(rec.dir.path)")
+    }
     @objc private func addPosture() { guard !screenCal.isRunning else { return }; pointer.hide(); screenCal.start(addPosture: true) }
     @objc private func togglePointer() { Settings.showGazePointer.toggle(); if !Settings.showGazePointer { pointer.hide() } }
     @objc private func forgetScreenCalibration() {

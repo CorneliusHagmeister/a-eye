@@ -176,6 +176,8 @@ enum CalibrationData {
 /// "Add a posture" runs just a short natural pass in whatever posture you're in.
 final class ScreenCalibrator {
     var onFinish: ((GazeModel?) -> Void)?
+    /// When set, frames are saved with their labels while each dot is being collected.
+    var recorder: GazeRecorder?
 
     private enum Kind { case natural, eyesOnly(anchor: CGPoint), headTurn }
     private struct Step { var point: CGPoint; var kind: Kind; var intro: String?; var label: String }
@@ -271,9 +273,11 @@ final class ScreenCalibrator {
         DispatchQueue.main.asyncAfter(deadline: .now() + settle) { [weak self] in
             guard let self, !self.cancelled else { return }
             self.collecting = true
+            self.recorder?.setStep((self.index, step.label, step.point))
             DispatchQueue.main.asyncAfter(deadline: .now() + collect) { [weak self] in
                 guard let self, !self.cancelled else { return }
                 self.collecting = false
+                self.recorder?.setStep(nil)
                 if case .headTurn = step.kind {
                     // The head sweeps while the eyes hold: each half-second is its own data point.
                     for chunk in stride(from: 0, to: self.samples.count - 2, by: 4) {

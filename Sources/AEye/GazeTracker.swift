@@ -23,6 +23,8 @@ struct GazeSample {
 final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     /// Called on the main queue for every processed frame; nil = no face.
     var onSample: ((GazeSample?) -> Void)?
+    /// Raw frame + face box + sample, on the vision queue (for recording test sets).
+    var frameTap: ((CVPixelBuffer, CGRect?, GazeSample?) -> Void)?
     private(set) var latest: GazeSample?
     private(set) var isRunning = false
 
@@ -123,6 +125,7 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             sample = GazeSample(yaw: yaw!, pitch: pitch!, faceX: faceX!, faceY: faceY!, faceSize: faceSize!,
                                 pupilX: pupilX ?? 0, pupilY: pupilY ?? 0, hasEyes: pupilX != nil, time: now)
         }
+        frameTap?(px, request.results?.max(by: { $0.boundingBox.width < $1.boundingBox.width })?.boundingBox, sample)
         DispatchQueue.main.async { [self] in
             if let sample { latest = sample }
             onSample?(sample)
