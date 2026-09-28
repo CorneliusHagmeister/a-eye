@@ -15,12 +15,15 @@ final class Recorder {
     private var ring: [Float] = []
     private var recording: [Float]?
     private var coolDown: DispatchWorkItem?
+    private var pendingEnd: (item: DispatchWorkItem, complete: () -> Void)?
     private(set) var level: Float = 0  // 0…1, for the HUD meter
 
     var isRunning: Bool { engine.isRunning }
 
     func begin() throws {
         coolDown?.cancel()
+        // Still in the previous press's post-roll: close it out now rather than lose it.
+        if let pe = pendingEnd { pe.item.cancel(); pendingEnd = nil; pe.complete() }
         if !engine.isRunning { try startEngine() }
         lock.lock()
         recording = ring  // pre-roll (empty on a cold start)
@@ -29,7 +32,7 @@ final class Recorder {
 
     /// Stops after the post-roll so trailing words aren't clipped; returns everything captured.
     func end(completion: @escaping ([Float]) -> Void) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + postRollSeconds) { [self] in
+        let complete = { [self] in
             lock.lock()
             let samples = recording ?? []
             recording = nil
@@ -37,6 +40,9 @@ final class Recorder {
             scheduleCoolDown()
             completion(samples)
         }
+        let item = DispatchWorkItem { [self] in pendingEnd = nil; complete() }
+        pendingEnd = (item, complete)
+        DispatchQueue.main.asyncAfter(deadline: .now() + postRollSeconds, execute: item)
     }
 
     /// Audio recorded so far, from `start` on (index into the current recording).

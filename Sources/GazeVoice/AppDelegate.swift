@@ -9,7 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let ptt = PushToTalk()
     private let hud = HUD()
     private let dot = TargetDot()
-    private lazy var dispatcher = Dispatcher(transcriber: Self.makeTranscriber())
+    private let delivery = Delivery()
+    private lazy var engine: SpeechEngine = Engines.make(Settings.engine) ?? Engines.make("whisper") ?? Engines.make("apple")!
     private var statusItem: NSStatusItem!
 
     // Recording state
@@ -17,8 +18,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var latchUntil = Date.distantPast
     private var meter: Timer?
     private var recordingActive = false
-    private let segmenter = Segmenter()
-    private var phrasesSent = 0
+    private var session: SpeechSession?
+    private var press: Press?
+    private var sentSamples = 0
+    private var livePartial = ""
 
     // Calibration state
     private enum CalMode { case none, add, recalibrate([UUID]) }
@@ -36,6 +39,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if CommandLine.arguments.contains("--mic-test") { runMicTest(); return }
         if CommandLine.arguments.contains("--inspect") { runInspect(); return }
+        if let i = CommandLine.arguments.firstIndex(of: "--engine-test"), i + 2 < CommandLine.arguments.count {
+            runEngineTest(CommandLine.arguments[i + 1], CommandLine.arguments[i + 2]); return
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--segment-test"), i + 1 < CommandLine.arguments.count {
             runSegmentTest(CommandLine.arguments[i + 1]); return
         }
@@ -65,12 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
-    func applicationWillTerminate(_ note: Notification) { dispatcher.transcriber.shutdown() }
-
-    private static func makeTranscriber() -> Transcriber {
-        if Settings.transcriber == "whisper", let w = WhisperTranscriber() { return w }
-        return AppleTranscriber()
-    }
+    func applicationWillTerminate(_ note: Notification) { engine.shutdown() }
 
     private func requestPermissions() {
         AVCaptureDevice.requestAccess(for: .video) { ok in
@@ -93,7 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
             // You clicked somewhere; don't trust stale focus (our own clicks excepted).
-            if Date().timeIntervalSince(Input.lastSyntheticClick) > 0.5 { self?.dispatcher.focusedTarget = nil }
+            if Date().timeIntervalSince(Input.lastSyntheticClick) > 0.5 { self?.delivery.focusedTarget = nil }
         }
         prepareElectronTrees()
     }
@@ -105,6 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Grace period after key-down: your head may still be turning to the target.
         if ptt.isHeld, Date() < latchUntil, let cur, cur != latched?.id, let t = store.target(cur) {
             latched = t
+            press?.target = t
             Log.info("re-latched → \(t.name)")
             Task { await WindowControl.focus(t, click: false) }
         }
@@ -134,56 +136,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if case .none = calMode {} else { beginCapture(); return }
         latched = store.target(classifier.current)
         latchUntil = Date().addingTimeInterval(0.4)
-        dispatcher.transcriber.prepare()
+        engine.prepare()
         do { try recorder.begin() } catch {
             hud.show("⚠︎ Mic: \(error.localizedDescription)", hideAfter: 3); return
         }
         recordingActive = true
-        segmenter.reset()
-        phrasesSent = 0
+        sentSamples = 0
+        livePartial = ""
+        let p = Press(target: latched, engine: engine.name)
+        press = p
+        delivery.track(p)
+        session = engine.startSession(sessionContext()) { [weak self] ev in self?.handle(ev, for: p) }
         if let t = latched { Task { await WindowControl.focus(t, click: false) } }
-        Log.info("talk ↓ → \(latched?.name ?? "front app")")
+        Log.info("talk ↓ → \(latched?.name ?? "front app") [\(engine.name)]")
         meter?.invalidate()
-        var tick = 0
         meter = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.pumpAudio()
             self?.showRecordingHUD()
-            tick += 1
-            if tick % 2 == 0 { self?.commitFinishedPhrase() }
         }
         showRecordingHUD()
     }
 
-    /// While the key is held: when you pause, send the phrase so far off to be transcribed
-    /// and pasted — you see text arriving as you talk instead of all at the end.
-    private func commitFinishedPhrase() {
-        guard recordingActive, Date() >= latchUntil else { return }
-        let s = recorder.samples(from: segmenter.cut)
-        guard let end = segmenter.findPhraseEnd(s) else { return }
-        segmenter.advance(by: end)
-        let phrase = Array(s[..<end])
-        guard segmenter.hasSpeech(phrase) else { return }
-        Log.info(String(format: "phrase %d committed (%.1fs)", phrasesSent + 1, Double(end) / Recorder.sampleRate))
-        dispatcher.submit(samples: phrase, target: latched, continuation: phrasesSent > 0, isFinal: false)
-        phrasesSent += 1
+    /// Feed the engine what the mic captured since the last tick.
+    private func pumpAudio() {
+        guard recordingActive, let session else { return }
+        let new = recorder.samples(from: sentSamples)
+        guard !new.isEmpty else { return }
+        sentSamples += new.count
+        session.append(new)
     }
 
     private func keyUp(_ held: TimeInterval) {
-        guard recordingActive else { return }  // e.g. the release of a calibration tap
+        guard recordingActive, let s = session, let p = press else { return }  // e.g. a calibration tap's release
         recordingActive = false
         meter?.invalidate(); meter = nil
-        let target = latched
+        session = nil
+        let sent = sentSamples
         Log.info(String(format: "talk ↑ after %.1fs", held))
-        showHUD("… \(target?.name ?? "transcribing")", for: target)
-        recorder.end { [weak self] samples in
-            guard let self else { return }
-            let rest = self.segmenter.cut < samples.count ? Array(samples[self.segmenter.cut...]) : []
-            if self.segmenter.hasSpeech(rest) {
-                self.dispatcher.submit(samples: rest, target: target, continuation: self.phrasesSent > 0)
-            } else if self.phrasesSent == 0 {
-                self.showHUD("(nothing heard)", for: target, hideAfter: 1.2)
-            } else {
-                self.hud.hide()
-            }
+        showHUD("… \(p.target?.name ?? "transcribing")\(livePartial.isEmpty ? "" : ": " + tail(livePartial))", for: p.target)
+        recorder.end { samples in
+            // Keep the whole press on disk first: the fallback and "Recent" retry use it.
+            let url = Paths.recordings.appendingPathComponent(Delivery.stamp() + ".wav")
+            if (try? WAV.write(samples, to: url)) != nil { p.wav = url }
+            if sent < samples.count { s.append(Array(samples[sent...])) }  // incl. post-roll
+            s.finish()
         }
     }
 
@@ -191,15 +187,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard recordingActive else { return }
         recordingActive = false
         meter?.invalidate(); meter = nil
+        session?.cancel(); session = nil
+        if let p = press { delivery.forget(p) }
         recorder.cancel()
         hud.hide()
     }
 
+    private func sessionContext() -> SessionContext {
+        let names = store.targets.flatMap { [$0.appName, $0.name] }
+        let vocab = ["Claude", "Claude Code", "VS Code", "Cursor", "TypeScript", "Swift", "npm", "git",
+                     "PR", "API", "JSON", "README", "repo", "commit"]
+        var seen = Set<String>()
+        return SessionContext(hints: (names + vocab).filter { seen.insert($0).inserted }, languages: Settings.languages)
+    }
+
+    private func handle(_ ev: SpeechEvent, for p: Press) {
+        switch ev {
+        case .partial(let t):
+            if p === press, recordingActive { livePartial = t }
+        case .final(let t):
+            let text = p.phrases > 0 ? " " + t : t
+            p.text += text
+            p.phrases += 1
+            if p === press { livePartial = "" }
+            delivery.enqueue(.text(text, p))
+        case .failed(let msg):
+            p.error = msg
+            Log.info("engine error: \(msg)")
+            if !recordingActive { hud.show("⚠︎ \(msg.prefix(90))", hideAfter: 3) }
+        case .done:
+            finishPress(p)
+        }
+    }
+
+    private func finishPress(_ p: Press) {
+        // The cloud engine failed before producing anything: transcribe the saved audio locally.
+        if p.phrases == 0, p.error != nil, let wav = p.wav {
+            Log.info("falling back to local transcription")
+            Task { @MainActor in
+                let local = Engines.localTranscriber()
+                if let text = try? await local.transcribe(wav: wav, hints: self.sessionContext().hints, previous: ""),
+                   !ChunkedSession.clean(text).isEmpty {
+                    p.text = ChunkedSession.clean(text); p.phrases = 1
+                    self.delivery.enqueue(.text(p.text, p))
+                }
+                self.completePress(p)
+            }
+            return
+        }
+        completePress(p)
+    }
+
+    private func completePress(_ p: Press) {
+        if Settings.autoSubmit, p.phrases > 0 { delivery.enqueue(.submit(p)) }
+        if p.state == .undeliverable {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(p.text, forType: .string)
+            hud.show("⚠︎ Couldn't find \(p.target?.name ?? "the window") — text copied to clipboard", hideAfter: 3)
+        } else if p.phrases == 0 {
+            p.state = p.error == nil ? .empty : .failed
+            if !recordingActive { showHUD(p.error == nil ? "(nothing heard)" : "⚠︎ Failed — audio kept, retry from Recent",
+                                          for: p.target, hideAfter: 1.5) }
+        } else {
+            p.state = .done
+        }
+        logPress(p)
+    }
+
+    private func logPress(_ p: Press) {
+        Log.info("press done [\(p.engine)] → \(p.target?.name ?? "front app"): \(p.text)")
+        Delivery.appendHistory(p)
+    }
+
+    private func tail(_ s: String, _ n: Int = 60) -> String { s.count > n ? "…" + s.suffix(n) : s }
+
     private func showRecordingHUD() {
         let bars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇"]
         let lvl = bars[min(bars.count - 1, Int(recorder.level * Float(bars.count)))]
-        let queued = dispatcher.inFlight > 0 ? "  · \(dispatcher.inFlight) pending" : ""
-        showHUD("● \(latched?.name ?? "focused app")  \(lvl)\(queued)", for: latched)
+        let live = livePartial.isEmpty ? "" : "  " + tail(livePartial)
+        showHUD("● \(latched?.name ?? "focused app")  \(lvl)\(live)", for: latched)
     }
 
     private func showHUD(_ text: String, for t: Target?, hideAfter: TimeInterval? = nil) {
@@ -216,28 +282,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: dispatcher
 
     private func wireDispatcher() {
-        dispatcher.hints = { [weak self] in
-            let names = self?.store.targets.flatMap { [$0.appName, $0.name] } ?? []
-            return names + ["Claude", "Claude Code", "VS Code", "Cursor", "TypeScript", "Swift",
-                            "npm", "git", "PR", "API", "JSON", "README", "repo", "commit"]
-        }
-        dispatcher.currentFocusTarget = { [weak self] in
+        delivery.currentFocusTarget = { [weak self] in
             guard let self, self.ptt.isHeld else { return nil }
             return self.latched
         }
-        dispatcher.onUpdate = { [weak self] u in
-            guard let self, !self.ptt.isHeld else { return }
-            switch u.state {
-            case .delivered:
-                self.showHUD("✓ \(u.target?.name ?? "pasted"): \(u.text.prefix(48))", for: u.target, hideAfter: 1.6)
-            case .failed:
-                self.showHUD("⚠︎ Transcription failed — audio kept, retry from the menu", for: u.target, hideAfter: 3)
-            case .undeliverable:
-                self.hud.show("⚠︎ Couldn't find \(u.target?.name ?? "the window") — text copied to clipboard", hideAfter: 3)
-            case .empty:
-                self.showHUD("(nothing heard)", for: u.target, hideAfter: 1.2)
-            default: break
-            }
+        delivery.onDelivered = { [weak self] p, text in
+            guard let self, !self.recordingActive else { return }
+            self.showHUD("✓ \(p.target?.name ?? "pasted"): \(self.tail(text, 48))", for: p.target, hideAfter: 1.6)
         }
     }
 
@@ -393,31 +444,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !store.targets.isEmpty { menu.addItem(item("Remove all targets", #selector(removeAll))) }
         menu.addItem(.separator())
 
-        if !dispatcher.recent.isEmpty {
+        if !delivery.recent.isEmpty {
             let sub = NSMenu()
-            for u in dispatcher.recent {
+            for p in delivery.recent {
                 let label: String
-                switch u.state {
-                case .failed: label = "⚠︎ failed — click to retry"
-                case .transcribing: label = "… transcribing"
+                switch p.state {
+                case .live: label = "… \(p.text.isEmpty ? "listening" : String(p.text.suffix(50)))"
+                case .failed: label = "⚠︎ failed — click to transcribe locally"
                 case .empty: label = "(nothing heard)"
-                case .undeliverable: label = "not delivered — click to copy: \(u.text.prefix(40))"
-                default: label = String(u.text.prefix(60))
+                case .undeliverable: label = "not delivered — click to copy: \(p.text.prefix(40))"
+                case .done: label = String(p.text.prefix(60))
                 }
-                sub.addItem(item("\(u.target?.name ?? "—"): \(label)", #selector(recentClicked(_:)), u))
+                sub.addItem(item("\(p.target?.name ?? "—"): \(label)", #selector(recentClicked(_:)), p))
             }
             let r = item("Recent", nil); r.submenu = sub
             menu.addItem(r)
         }
         menu.addItem(item("Press Return after pasting", #selector(toggleSubmit), on: Settings.autoSubmit))
         menu.addItem(item("Show target in menu bar", #selector(toggleMenuBar), on: Settings.showGazeInMenuBar))
-        let whisper = dispatcher.transcriber as? WhisperTranscriber ?? WhisperTranscriber()
-        let tsub = NSMenu()
-        tsub.addItem(item("Apple on-device", #selector(chooseApple), on: !(dispatcher.transcriber is WhisperTranscriber)))
-        tsub.addItem(whisper.map { item($0.name, #selector(chooseWhisper), on: dispatcher.transcriber is WhisperTranscriber) }
-                     ?? item("Whisper (not installed)", nil))
-        let ti = item("Transcriber: \(dispatcher.transcriber.name)", nil); ti.submenu = tsub
-        menu.addItem(ti)
+
+        let esub = NSMenu()
+        for (id, name) in Engines.catalog {
+            let e = id == engine.id ? engine : Engines.make(id)
+            var title = name
+            if e == nil { title += id == "parakeet" ? " — needs Swift 6 toolchain" : " — not installed" }
+            else if e?.hasKey == false { title += " — add API key…" }
+            let i = item(title, e == nil ? nil : #selector(chooseEngine(_:)), id, on: id == engine.id)
+            esub.addItem(i)
+        }
+        esub.addItem(.separator())
+        for (id, name) in Engines.catalog where Engines.make(id)?.needsKey == true {
+            esub.addItem(item("\(Keychain.get(id) == nil ? "Add" : "Change") \(name) API key…", #selector(editKey(_:)), id))
+        }
+        let ei = item("Engine: \(engine.name)", nil); ei.submenu = esub
+        menu.addItem(ei)
         menu.addItem(item(tracker.isRunning ? "Pause camera" : "Resume camera", #selector(toggleCamera)))
         menu.addItem(item("Open recordings folder", #selector(openRecordings)))
         menu.addItem(.separator())
@@ -431,12 +491,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func removeAll() { store.removeAll() }
     @objc private func toggleSubmit() { Settings.autoSubmit.toggle() }
     @objc private func toggleMenuBar() { Settings.showGazeInMenuBar.toggle(); updateStatusTitle(face: tracker.latest != nil) }
-    @objc private func chooseApple() {
-        dispatcher.transcriber.shutdown()
-        Settings.transcriber = "apple"; dispatcher.transcriber = AppleTranscriber()
+    @objc private func chooseEngine(_ s: NSMenuItem) {
+        guard let id = s.representedObject as? String, let e = Engines.make(id) else { return }
+        if !e.hasKey, !promptForKey(id) { return }
+        engine.shutdown()
+        engine = e
+        Settings.engine = id
+        hud.show("Engine: \(e.name)", hideAfter: 1.5)
     }
-    @objc private func chooseWhisper() {
-        if let w = WhisperTranscriber() { Settings.transcriber = "whisper"; dispatcher.transcriber = w }
+
+    @objc private func editKey(_ s: NSMenuItem) {
+        if let id = s.representedObject as? String { _ = promptForKey(id) }
+    }
+
+    /// Asks for an API key and stores it in the Keychain. Returns true if one is saved.
+    private func promptForKey(_ id: String) -> Bool {
+        let name = Engines.catalog.first { $0.id == id }?.name ?? id
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "\(name) API key"
+        alert.informativeText = "Stored in your macOS Keychain and only sent to \(name)."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        if Keychain.get(id) != nil { alert.addButton(withTitle: "Remove key") }
+        alert.window.initialFirstResponder = field
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { return false }
+            Keychain.set(id, key)
+            return true
+        case .alertThirdButtonReturn:
+            Keychain.set(id, nil)
+            return false
+        default:
+            return Keychain.get(id) != nil
+        }
     }
     @objc private func toggleCamera() {
         tracker.isRunning ? tracker.stop() : tracker.start()
@@ -447,14 +539,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
     @objc private func recentClicked(_ s: NSMenuItem) {
-        guard let u = s.representedObject as? Utterance else { return }
-        if u.state == .failed { dispatcher.retry(u); return }
+        guard let p = s.representedObject as? Press else { return }
+        if p.state == .failed, let wav = p.wav {  // retry locally; result goes to the clipboard
+            hud.show("Transcribing locally…")
+            Task { @MainActor in
+                let text = (try? await Engines.localTranscriber().transcribe(wav: wav, hints: self.sessionContext().hints, previous: "")) ?? ""
+                p.text = ChunkedSession.clean(text)
+                p.state = p.text.isEmpty ? .empty : .done
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(p.text, forType: .string)
+                self.hud.show(p.text.isEmpty ? "(nothing heard)" : "Copied: \(self.tail(p.text, 48))", hideAfter: 2)
+            }
+            return
+        }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(u.text, forType: .string)
+        NSPasteboard.general.setString(p.text, forType: .string)
         hud.show("Copied", hideAfter: 1)
     }
 
     // MARK: CLI test hooks
+
+    /// `GazeVoice --engine-test <engine-id> file.wav` — plays a 16kHz WAV into an engine in
+    /// real time (100ms chunks, like the mic) and logs every event with its timing.
+    private func runEngineTest(_ id: String, _ path: String) {
+        guard let e = Engines.make(id), let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            Log.info("engine-test: no engine \(id) or unreadable file"); exit(1)
+        }
+        let all: [Float] = data.dropFirst(44).withUnsafeBytes { $0.bindMemory(to: Int16.self).map { Float($0) / 32767 } }
+        e.prepare()
+        let t0 = Date()
+        let stamp = { String(format: "%5.2fs", Date().timeIntervalSince(t0)) }
+        let s = e.startSession(sessionContext()) { ev in
+            switch ev {
+            case .partial(let t): Log.info("\(stamp()) partial: \(t)")
+            case .final(let t): Log.info("\(stamp()) FINAL: \(t)")
+            case .failed(let m): Log.info("\(stamp()) failed: \(m)")
+            case .done: Log.info("\(stamp()) done"); e.shutdown(); exit(0)
+            }
+        }
+        var i = 0
+        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { t in
+            let j = min(all.count, i + 1600)
+            s.append(Array(all[i..<j])); i = j
+            if i >= all.count { t.invalidate(); Log.info("\(stamp()) audio end"); s.finish() }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { Log.info("engine-test timeout"); exit(1) }
+    }
 
     /// `GazeVoice --segment-test file.wav` — replays a 16kHz 16-bit WAV as if live and logs
     /// where phrases would be committed.
@@ -524,11 +654,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func runTranscribeCLI(_ path: String) {
         Task { @MainActor in
             _ = await AppleTranscriber.requestAuthorization()
-            let t = Self.makeTranscriber()
+            let t = Engines.localTranscriber()
             for run in 1...2 {  // second run shows warm (resident model) latency
                 let t0 = Date()
                 do {
-                    let text = try await t.transcribe(wav: URL(fileURLWithPath: path), hints: ["Claude", "VS Code"])
+                    let text = try await t.transcribe(wav: URL(fileURLWithPath: path), hints: ["Claude", "VS Code"], previous: "")
                     Log.info(String(format: "[%@ run %d %.2fs] %@", t.name, run, Date().timeIntervalSince(t0), text))
                 } catch {
                     Log.info("transcribe error: \(error)")

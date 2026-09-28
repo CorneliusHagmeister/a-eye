@@ -1,20 +1,33 @@
 import Foundation
 import Speech
 
-protocol Transcriber {
+/// Transcribes one finished clip. Wrapped by `ChunkedEngine` to stream phrase by phrase.
+protocol Transcriber: AnyObject {
     var name: String { get }
-    /// Called on talk-key down so slow engines can warm up while you speak.
+    var needsKey: Bool { get }
+    /// Fast enough to re-run on the phrase in progress every ~0.5s for live text.
+    var livePartials: Bool { get }
     func prepare()
     func shutdown()
-    func transcribe(wav: URL, hints: [String]) async throws -> String
+    /// `previous` is the text of the phrase before this one, for continuity.
+    func transcribe(wav: URL, hints: [String], previous: String) async throws -> String
 }
 
 extension Transcriber {
+    var needsKey: Bool { false }
+    var livePartials: Bool { false }
     func prepare() {}
     func shutdown() {}
+
+    func transcribe(samples: [Float], hints: [String], previous: String) async throws -> String {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("gv-\(UUID().uuidString).wav")
+        try WAV.write(samples, to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        return try await transcribe(wav: url, hints: hints, previous: previous)
+    }
 }
 
-/// Apple's built-in recognizer, forced on-device. No download, decent quality.
+/// Apple's built-in recognizer, forced on-device. Needs Siri & Dictation enabled.
 final class AppleTranscriber: Transcriber {
     let name = "Apple on-device"
     private let recognizer: SFSpeechRecognizer
@@ -31,7 +44,7 @@ final class AppleTranscriber: Transcriber {
         }
     }
 
-    func transcribe(wav: URL, hints: [String]) async throws -> String {
+    func transcribe(wav: URL, hints: [String], previous: String) async throws -> String {
         let req = SFSpeechURLRecognitionRequest(url: wav)
         req.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
         req.addsPunctuation = true
@@ -57,7 +70,7 @@ final class AppleTranscriber: Transcriber {
 /// whisper.cpp (`brew install whisper-cpp`) with a ggml model in
 /// ~/Library/Application Support/GazeVoice/models/. Keeps `whisper-server` resident while
 /// you're dictating — started on key-down so the model loads while you speak — and stops it
-/// after a few idle minutes so ~1GB isn't held all day. Falls back to the one-shot CLI.
+/// after a few idle minutes so ~700MB isn't held all day. Falls back to the one-shot CLI.
 final class WhisperTranscriber: Transcriber {
     let cli: URL
     let server: URL?
@@ -115,46 +128,40 @@ final class WhisperTranscriber: Transcriber {
         guard let p = process else { return }
         if p.isRunning { p.terminate() }
         process = nil; ready = nil
-        Log.info("whisper-server stopped (idle)")
+        Log.info("whisper-server stopped")
     }
 
-    func transcribe(wav: URL, hints: [String]) async throws -> String {
+    func transcribe(wav: URL, hints: [String], previous: String) async throws -> String {
         await MainActor.run { prepare() }
+        let prompt = (hints + (previous.isEmpty ? [] : [String(previous.suffix(200))])).joined(separator: ", ")
         if let ready, await ready.value {
-            do { return clean(try await viaServer(wav: wav, hints: hints)) } catch {
+            do { return clean(try await viaServer(wav: wav, prompt: prompt)) } catch {
                 Log.info("whisper-server request failed, using CLI: \(error)")
             }
         }
-        return clean(try await viaCLI(wav: wav, hints: hints))
+        return clean(try await viaCLI(wav: wav, prompt: prompt))
     }
 
-    private func viaServer(wav: URL, hints: [String]) async throws -> String {
-        let boundary = "gv-\(UUID().uuidString)"
-        var body = Data()
-        func field(_ name: String, _ value: String) {
-            body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
-        }
-        field("response_format", "text")
-        field("prompt", hints.joined(separator: ", "))
-        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
-        body.append(try Data(contentsOf: wav))
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+    private func viaServer(wav: URL, prompt: String) async throws -> String {
+        var form = Multipart()
+        form.field("response_format", "text")
+        form.field("prompt", prompt)
+        form.file("file", filename: "a.wav", type: "audio/wav", data: try Data(contentsOf: wav))
         var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/inference")!)
         req.httpMethod = "POST"
         req.timeoutInterval = 120
-        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        let (data, resp) = try await URLSession.shared.upload(for: req, from: body)
+        req.setValue(form.contentType, forHTTPHeaderField: "Content-Type")
+        let (data, resp) = try await URLSession.shared.upload(for: req, from: form.body)
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
             throw NSError(domain: "whisper", code: (resp as? HTTPURLResponse)?.statusCode ?? -1)
         }
         return String(decoding: data, as: UTF8.self)
     }
 
-    private func viaCLI(wav: URL, hints: [String]) async throws -> String {
+    private func viaCLI(wav: URL, prompt: String) async throws -> String {
         let p = Process()
         p.executableURL = cli
-        p.arguments = ["-m", model.path, "-f", wav.path, "-nt", "-np", "-l", "auto",
-                       "--prompt", hints.joined(separator: ", ")]
+        p.arguments = ["-m", model.path, "-f", wav.path, "-nt", "-np", "-l", "auto", "--prompt", prompt]
         let out = Pipe()
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
@@ -169,7 +176,69 @@ final class WhisperTranscriber: Transcriber {
     }
 
     private func clean(_ s: String) -> String {
-        s.replacingOccurrences(of: "[BLANK_AUDIO]", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        s.replacingOccurrences(of: "[BLANK_AUDIO]", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Wispr Flow's REST API, one call per phrase (~0.4s server time). Their WebSocket API only
+/// returns text at the end, so per-phrase REST gets text in sooner. Tells Flow it's dictating
+/// into an AI app and what came before, which it uses for casing and punctuation.
+final class WisprTranscriber: Transcriber {
+    let name = "Wispr Flow"
+    var needsKey: Bool { true }
+
+    func transcribe(wav: URL, hints: [String], previous: String) async throws -> String {
+        guard let key = Keychain.get("wispr") else { throw EngineError.missingKey("Wispr Flow") }
+        let body: [String: Any] = [
+            "audio": try Data(contentsOf: wav).base64EncodedString(),
+            "language": Settings.languages,
+            "context": [
+                "app": ["type": "ai"],
+                "dictionary_context": hints,
+                "textbox_contents": ["before_text": previous, "selected_text": "", "after_text": ""],
+            ],
+        ]
+        var req = URLRequest(url: URL(string: "https://platform-api.wisprflow.ai/api/v1/dash/api")!)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 30
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        guard status == 200, let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw EngineError.http("Wispr Flow", status, String(decoding: data.prefix(300), as: UTF8.self))
+        }
+        return json["text"] as? String ?? ""
+    }
+}
+
+enum EngineError: LocalizedError {
+    case missingKey(String)
+    case http(String, Int, String)
+    case closed(String, String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingKey(let s): return "No \(s) API key — add one from the menu"
+        case .http(let s, let code, let body): return "\(s) HTTP \(code): \(body)"
+        case .closed(let s, let why): return "\(s) connection closed: \(why)"
+        }
+    }
+}
+
+struct Multipart {
+    let boundary = "gv-\(UUID().uuidString)"
+    private(set) var body = Data()
+    var contentType: String { "multipart/form-data; boundary=\(boundary)" }
+
+    mutating func field(_ name: String, _ value: String) {
+        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
+    }
+
+    mutating func file(_ name: String, filename: String, type: String, data: Data) {
+        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename)\"\r\nContent-Type: \(type)\r\n\r\n".data(using: .utf8)!)
+        body.append(data)
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
     }
 }

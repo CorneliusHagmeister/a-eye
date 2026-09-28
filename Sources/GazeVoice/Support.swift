@@ -49,9 +49,15 @@ enum Settings {
         get { d.object(forKey: "showGazeInMenuBar") as? Bool ?? true }
         set { d.set(newValue, forKey: "showGazeInMenuBar") }
     }
-    static var transcriber: String {
-        get { d.string(forKey: "transcriber") ?? "apple" }
-        set { d.set(newValue, forKey: "transcriber") }
+    /// Speech engine id (see `Engines.catalog`).
+    static var engine: String {
+        get { d.string(forKey: "engine") ?? "whisper" }
+        set { d.set(newValue, forKey: "engine") }
+    }
+    /// Languages you dictate in (ISO 639-1). Cloud engines use it to skip/limit detection.
+    static var languages: [String] {
+        get { d.stringArray(forKey: "languages") ?? ["en", "de"] }
+        set { d.set(newValue, forKey: "languages") }
     }
     /// Seconds the mic stays open after a recording so the next one has pre-roll and no start lag.
     static var micWarmSeconds: Double {
