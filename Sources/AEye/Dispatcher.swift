@@ -17,6 +17,11 @@ final class Press {
     var submitRequested = false
     /// In-flight OpenAI clean-ups; Return ("send it") waits for them so it sends the clean text.
     var cleanups: [Task<Void, Never>] = []
+    /// Rolling clean-up: what was said (quick-tidied pieces) and the rewrite state.
+    var pieces: [String] = []
+    var rewriting = false
+    var rewriteDirty = false
+    var rewrittenUpTo = 0
     var error: String?
     var wav: URL?
 
@@ -33,6 +38,8 @@ final class Delivery {
     enum Job {
         case text(String, Press, segment: UUID?)
         case replace(UUID, String, Press)
+        /// Replace everything this press has pasted with a new version (rolling clean-up).
+        case rewrite(Press, String)
         case submit(Press), clear(Press), undoLast(Press)
     }
 
@@ -50,7 +57,7 @@ final class Delivery {
     private var queue: [Job] = []
     private var running = false
     /// What we've pasted, in order, into the box `segmentsKey` since focus last changed.
-    private var segments: [(id: UUID, text: String)] = []
+    private var segments: [(id: UUID, press: UUID, text: String)] = []
     private var segmentsKey: String?
 
     var pending: Int { queue.count }
@@ -85,7 +92,7 @@ final class Delivery {
                 if !segments.isEmpty, !text.hasPrefix(" ") { text = " " + text }
                 if await deliver(text, to: press.target) {
                     if segmentsKey != key { segments = [] }  // deliver() may have refocused
-                    segments.append((id ?? UUID(), text))
+                    segments.append((id ?? UUID(), press.id, text))
                     segmentsKey = key
                     onDelivered?(press, text)
                 } else {
@@ -104,6 +111,23 @@ final class Delivery {
                 for _ in 0..<count { Input.key(51) }  // ⌫ back to the start of that sentence
                 segments[i].text = text
                 await Input.paste(segments[i...].map(\.text).joined(), submit: false)
+            case .rewrite(let press, let newText):
+                let key = press.target?.key ?? "front"
+                guard segmentsKey == key, focusedTarget == key || press.target == nil,
+                      let first = segments.firstIndex(where: { $0.press == press.id }) else { continue }
+                let last = segments.lastIndex(where: { $0.press == press.id })!
+                let lead = segments[first].text.hasPrefix(" ") ? " " : ""
+                let old = segments[first...].map(\.text).joined()
+                let new = lead + newText + segments[(last + 1)...].map(\.text).joined()
+                guard old != new else { continue }
+                // Edit only from the first difference: the part you've already read stays put.
+                let common = zip(old, new).prefix { $0 == $1 }.count
+                let deletions = old.count - common
+                guard deletions <= 4000, await deliver(nil, to: press.target) else { continue }
+                for _ in 0..<deletions { Input.key(51) }
+                let insert = String(new.dropFirst(common))
+                if !insert.isEmpty { await Input.paste(insert, submit: false) }
+                segments.replaceSubrange(first...last, with: [(UUID(), press.id, lead + newText)])
             case .submit(let press):
                 if press.state != .undeliverable { _ = await deliver(nil, to: press.target, submit: true) }
                 segments = []

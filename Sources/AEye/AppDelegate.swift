@@ -244,6 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         latchUntil = Date().addingTimeInterval(0.4)
         engine.prepare()
+        Cleanup.warm()
         do { try recorder.begin() } catch {
             hud.show("⚠︎ Mic: \(error.localizedDescription)", hideAfter: 3); return
         }
@@ -324,6 +325,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // text so clean-up can't tidy them away.
                 let cmd = VoiceCommands.interpret(t)
                 p.phrases += 1
+                if cmd.undoLast, Settings.cleanup == "openai", !p.pieces.isEmpty {
+                    // Mid-dictation "scratch that": let the rewrite apply the correction in context
+                    // (after a rewrite this press is one piece, so a blind undo would remove it all).
+                    pasteSentences(t, p)
+                    return
+                }
                 if cmd.undoLast { delivery.enqueue(.undoLast(p)) }
                 if cmd.clearFirst { delivery.enqueue(.clear(p)) }
                 if cmd.submit { p.submitRequested = true }
@@ -345,6 +352,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// clean-up on, every sentence also goes off in parallel and its cleaned version is
     /// swapped in place as soon as it comes back.
     private func pasteSentences(_ text: String, _ p: Press) {
+        if Settings.cleanup == "openai" {
+            // Rolling clean-up: paste the quick-tidied piece now, then have the whole
+            // dictation so far rewritten and edited in place as it gets clearer.
+            let quick = Cleanup.basic(text)
+            guard !quick.isEmpty else { return }
+            p.pieces.append(quick)
+            p.text += (p.text.isEmpty ? "" : " ") + quick
+            delivery.enqueue(.text(quick, p, segment: nil))
+            scheduleRewrite(p)
+            return
+        }
         for sentence in Self.sentences(text) {
             let quick = Settings.cleanup == "off" ? sentence : Cleanup.basic(sentence)
             guard !quick.isEmpty else { continue }
@@ -359,6 +377,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 p.text = p.text.replacingOccurrences(of: quick, with: cleaned)
                 self.delivery.enqueue(.replace(id, cleaned, p))
             })
+        }
+    }
+
+    /// One rewrite in flight per press; if more was said meanwhile, go again with the latest.
+    private func scheduleRewrite(_ p: Press) {
+        guard !p.rewriting else { p.rewriteDirty = true; return }
+        p.rewriting = true
+        p.rewriteDirty = false
+        let upTo = p.pieces.count
+        let transcript = p.pieces.joined(separator: " ")
+        p.cleanups.append(Task { @MainActor in
+            if let cleaned = await Cleanup.rewrite(transcript) {
+                // Pieces that arrived while this was in flight stay after the cleaned part.
+                let later = p.pieces[upTo...].joined(separator: " ")
+                let full = later.isEmpty ? cleaned : cleaned + " " + later
+                p.text = full
+                p.rewrittenUpTo = upTo
+                self.delivery.enqueue(.rewrite(p, full))
+            }
+            p.rewriting = false
+            if p.rewriteDirty || (p.state != .live && p.rewrittenUpTo < p.pieces.count) { self.scheduleRewrite(p) }
+        })
+    }
+
+    /// Waits until the rolling clean-up has covered everything said in this press.
+    private func settleRewrites(_ p: Press) async {
+        while true {
+            let pending = p.cleanups
+            for t in pending { await t.value }
+            if !p.rewriting, p.cleanups.count == pending.count { break }
         }
     }
 
@@ -410,8 +458,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !cmd.text.isEmpty { pasteSentences(cmd.text, p) }
             submit = (Settings.autoSubmit || cmd.submit) && !p.text.isEmpty
         }
-        // Send only once every sentence has been swapped for its cleaned version.
-        for t in p.cleanups { await t.value }
+        // Send only once the clean-up has caught up with everything said.
+        let polishing = p.rewriting && !recordingActive
+        if polishing { showHUD("✨ Polishing with OpenAI…", for: p.target) }
+        await settleRewrites(p)
+        if polishing, !recordingActive { showHUD("✓ Polished: \(tail(p.text, 48))", for: p.target, hideAfter: 1.6) }
         if submit { delivery.enqueue(.submit(p)) }
         if p.state == .undeliverable {
             // Paste-while-speaking: earlier phrases failed; copy the whole text now.
@@ -439,7 +490,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let lvl = bars[min(bars.count - 1, Int(recorder.level * Float(bars.count)))]
         let running = [press?.text ?? "", livePartial].filter { !$0.isEmpty }.joined(separator: " ")
         let live = running.isEmpty ? "" : "  " + tail(running)
-        showHUD("● \(latched?.name ?? "focused app")  \(lvl)\(live)", for: latched)
+        let polishing = press?.rewriting == true ? "  ✨ OpenAI" : ""
+        showHUD("● \(latched?.name ?? "focused app")  \(lvl)\(live)\(polishing)", for: latched)
     }
 
     private func showHUD(_ text: String, for t: Target?, hideAfter: TimeInterval? = nil) {
