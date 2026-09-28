@@ -51,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if CommandLine.arguments.contains("--mic-test") { runMicTest(); return }
         if CommandLine.arguments.contains("--inspect") { runInspect(); return }
         if CommandLine.arguments.contains("--gaze-fit-test") { runGazeFitTest(); return }
+        if CommandLine.arguments.contains("--refit") { runRefit(); return }
         if CommandLine.arguments.contains("--commands-test") { runCommandsTest(); return }
         if CommandLine.arguments.contains("--cleanup-test") { runCleanupTest(); return }
         if CommandLine.arguments.contains("--clipboard-test") { runClipboardTest(); return }
@@ -329,7 +330,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if cmd.undoLast, Settings.cleanup == "openai", !p.pieces.isEmpty {
                     // Mid-dictation "scratch that": let the rewrite apply the correction in context
                     // (after a rewrite this press is one piece, so a blind undo would remove it all).
-                    pasteSentences(t, p)
+                    if cmd.clearFirst { delivery.enqueue(.clear(p)) }
+                    if cmd.submit { p.submitRequested = true }
+                    pasteSentences(cmd.submit ? cmd.text : t, p)
                     return
                 }
                 if cmd.undoLast { delivery.enqueue(.undoLast(p)) }
@@ -367,17 +370,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for sentence in Self.sentences(text) {
             let quick = Settings.cleanup == "off" ? sentence : Cleanup.basic(sentence)
             guard !quick.isEmpty else { continue }
-            let id = UUID()
-            let context = p.text
             p.text += (p.text.isEmpty ? "" : " ") + quick
-            delivery.enqueue(.text(quick, p, segment: id))
-            guard Settings.cleanup == "openai" else { continue }
-            p.cleanups.append(Task { @MainActor in
-                let cleaned = await Cleanup.openAI(sentence, previous: context)
-                guard !cleaned.isEmpty, cleaned != quick else { return }
-                p.text = p.text.replacingOccurrences(of: quick, with: cleaned)
-                self.delivery.enqueue(.replace(id, cleaned, p))
-            })
+            delivery.enqueue(.text(quick, p, segment: nil))
         }
     }
 
@@ -868,6 +862,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: CLI test hooks
 
+    /// `AEye --refit` — refits the gaze model from the saved raw calibration samples (e.g. after
+    /// a change to the fitting code) and saves it; logs the result next to head-only.
+    private func runRefit() {
+        let data = CalibrationData.load()
+        guard let m = GazeModel.fit(data) else { Log.info("refit: no calibration data"); exit(1) }
+        m.save()
+        let h = GazeModel.fit(data, useEyes: false)
+        Log.info(String(format: "refit: %d points · leave-one-dot-out ±%.0fpx (head only ±%.0fpx) · gains %.1f/%.1f · eyes %@",
+                        data.count, m.errorPx, h?.errorPx ?? -1, m.gx, m.gy, m.eyes ? "on" : "off"))
+        exit(0)
+    }
+
     /// `AEye --clipboard-test` — offers text on the clipboard the way paste does (no ⌘V) and
     /// logs when another process reads it, then restores the previous clipboard.
     private func runClipboardTest() {
@@ -889,8 +895,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// `AEye --cleanup-test` — sends sample dictations through OpenAI clean-up (needs the
-    /// OpenAI key in the Keychain) and logs latency and output for each.
+    /// `AEye --cleanup-test` — sends sample dictations through the rolling OpenAI rewrite
+    /// (needs the OpenAI key in the Keychain) and logs latency and output for each.
     private func runCleanupTest() {
         let samples = [
             "Um so I I think we should, uh, like, run the tests first and then, you know, open the PR.",
@@ -899,7 +905,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "What's the capital of France?",
         ]
         Task { @MainActor in
-            for s in samples { _ = await Cleanup.openAI(s, previous: "") }
+            for s in samples { _ = await Cleanup.rewrite(s) }
             exit(0)
         }
     }

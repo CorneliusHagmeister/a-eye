@@ -30,14 +30,13 @@ final class Press {
 
 /// Pastes committed text strictly in order, each piece into its press's target.
 ///
-/// Every sentence pasted into the current box is remembered as a segment, so a cleaned-up
-/// version can be swapped in afterwards (delete back to it, retype it and anything after
-/// it) and "scratch that" can remove exactly the last one. Segments are dropped the moment
+/// Everything pasted into the current box is remembered as segments, so the rolling clean-up
+/// can rewrite a press in place (editing from the first difference) and "scratch that" can
+/// remove exactly the last piece. Segments are dropped the moment
 /// you click or type yourself — then the caret may have moved and editing blind is unsafe.
 final class Delivery {
     enum Job {
         case text(String, Press, segment: UUID?)
-        case replace(UUID, String, Press)
         /// Replace everything this press has pasted with a new version (rolling clean-up).
         case rewrite(Press, String)
         case submit(Press), clear(Press), undoLast(Press)
@@ -59,8 +58,6 @@ final class Delivery {
     /// What we've pasted, in order, into the box `segmentsKey` since focus last changed.
     private var segments: [(id: UUID, press: UUID, text: String)] = []
     private var segmentsKey: String?
-
-    var pending: Int { queue.count }
 
     func track(_ p: Press) {
         recent.insert(p, at: 0)
@@ -99,21 +96,6 @@ final class Delivery {
                     press.state = .undeliverable
                     onUndeliverable?(press)
                 }
-            case .replace(let id, var text, let press):
-                let key = press.target?.key ?? "front"
-                // Only while the caret is where we left it: same box, nothing typed or clicked since.
-                guard segmentsKey == key, focusedTarget == key || press.target == nil,
-                      let i = segments.firstIndex(where: { $0.id == id }), segments[i].text != text else { continue }
-                if segments[i].text.hasPrefix(" "), !text.hasPrefix(" ") { text = " " + text }
-                let tail = segments[i...]
-                let count = tail.reduce(0) { $0 + $1.text.count }
-                guard count <= 3000, await deliver(nil, to: press.target) else { continue }
-                guard boxEndsWith(tail.map(\.text).joined()) else { continue }
-                for _ in 0..<count { Input.key(51) }  // ⌫ back to the start of that sentence
-                let retype = [text] + tail.dropFirst().map(\.text)
-                await Input.paste(retype.joined(), submit: false)
-                // Awaits above can see segments reset (you typed/clicked): look it up again.
-                if let j = segments.firstIndex(where: { $0.id == id }) { segments[j].text = text }
             case .rewrite(let press, let newText):
                 let key = press.target?.key ?? "front"
                 guard segmentsKey == key, focusedTarget == key || press.target == nil,

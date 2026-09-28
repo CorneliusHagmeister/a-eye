@@ -27,7 +27,8 @@ struct GazeModel: Codable {
     var hzMin: Double
     var hzMax: Double
 
-    // Rough FaceTime-camera field of view (tan of half-angles) for the CIF preset.
+    // Rough FaceTime-camera field of view (tan of half-angles); independent of the capture
+    // preset since face position and size are normalised.
     static let tanH = 0.58, tanV = 0.47
 
     static func load() -> GazeModel? {
@@ -85,7 +86,8 @@ struct GazeModel: Codable {
         let meanPupil = (withEyes.map(\.0.pupilX).reduce(0, +) / Double(max(withEyes.count, 1)),
                          withEyes.map(\.0.pupilY).reduce(0, +) / Double(max(withEyes.count, 1)))
         let quadratic = data.count >= (eyes ? 16 : 12)
-        let gains = stride(from: 0.6, through: 2.4, by: 0.1).map { $0 }
+        // Wide range: a real calibration hit both edges of 0.6…2.4.
+        let gains = stride(from: 0.3, through: 3.0, by: 0.1).map { $0 }
         // Head gain prior: without eye data the head has to account for the eyes too (~1.3);
         // with it, the head should explain roughly its own angle (~1.0).
         let centre = eyes ? 1.0 : 1.3
@@ -104,15 +106,21 @@ struct GazeModel: Codable {
             if best == nil || cost < best!.cost { best = (gx, gy, cx, cy, cost) }
         } }
         guard let b = best else { return nil }
+        // Leave-one-DOT-out at the chosen gains: all points for the same dot (the head-only
+        // phase gives ~14 per dot) are held out together, so siblings can't flatter the score.
         var errors: [Double] = []
-        for i in data.indices {  // leave-one-out at the chosen gains: honest runtime error
-            var rest = data; rest.remove(at: i)
+        let dotKey = { (p: CGPoint) in "\(Int(p.x.rounded())),\(Int(p.y.rounded()))" }
+        for key in Set(data.map { dotKey($0.1) }) {
+            let rest = data.filter { dotKey($0.1) != key }
+            let held = data.filter { dotKey($0.1) == key }
             let X = rest.map { features($0.0, gx: b.gx, gy: b.gy, quadratic: quadratic, eyes: eyes, meanPupil: meanPupil) }
             guard let ax = solve(X, rest.map { Double($0.1.x) }), let ay = solve(X, rest.map { Double($0.1.y) }) else { continue }
             let m = GazeModel(gx: b.gx, gy: b.gy, eyes: eyes, meanPupilX: meanPupil.0, meanPupilY: meanPupil.1,
                               cx: ax, cy: ay, errorPx: 0, points: 0, hzMin: 0, hzMax: 0)
-            let p = m.predict(data[i].0)
-            errors.append(hypot(p.x - data[i].1.x, p.y - data[i].1.y))
+            for (s, target) in held {
+                let p = m.predict(s)
+                errors.append(hypot(p.x - target.x, p.y - target.y))
+            }
         }
         errors.sort()
         let hz = data.map { distance($0.0) }

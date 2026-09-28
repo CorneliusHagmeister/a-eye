@@ -24,7 +24,7 @@ import onnxruntime as ort
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TAN_H, TAN_V = 0.58, 0.47  # same camera FOV assumption as GazeModel.swift
-GAINS = np.round(np.arange(0.6, 2.41, 0.1), 2)
+GAINS = np.round(np.arange(0.3, 3.01, 0.1), 2)  # same range as GazeModel.fit
 
 
 class LearnedGaze:

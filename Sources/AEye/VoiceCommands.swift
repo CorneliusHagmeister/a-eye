@@ -13,8 +13,6 @@ struct VoiceCommands {
     var undoLast = false
     var submit = false
 
-    var isCommandOnly: Bool { text.isEmpty && (clearFirst || undoLast) }
-
     private static let clear = ["clear the input", "clear input", "clear the field", "clear the box",
                                 "clear everything", "clear it all", "clear all"]
     private static let scratch = ["scratch that", "undo that", "delete that", "strike that"]
