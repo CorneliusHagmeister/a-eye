@@ -1,4 +1,4 @@
-# GazeVoice
+# A-EYE
 
 Voice input that goes where you're looking. Hold **Right ⌥**, talk, let go — the text lands
 in the input box you were looking at (a Claude Code pane, Claude Desktop, Discord, …),
@@ -31,16 +31,16 @@ Needs Command Line Tools with Swift 6 (`sudo softwareupdate --install "Command L
 
 ```bash
 ./scripts/build-app.sh
-open dist/GazeVoice.app
+open dist/A-EYE.app
 ```
 
 Grant Camera, Microphone and Accessibility when asked. The Parakeet model (~470MB) downloads
 on first use. For Whisper: `brew install whisper-cpp` and put a ggml model in
-`~/Library/Application Support/GazeVoice/models/`.
+`~/Library/Application Support/A-EYE/models/`.
 
 ## Debug hooks
 
-`GazeVoice.app/Contents/MacOS/GazeVoice` accepts `--engine-test <engine> file.wav`,
+`A-EYE.app/Contents/MacOS/AEye` accepts `--engine-test <engine> file.wav`,
 `--transcribe file.wav`, `--mic-test`, `--inspect`, `--gaze-fit-test`, `--commands-test`,
-`--segment-test file.wav` (run via `open -W -n dist/GazeVoice.app --args …`).
-Log: `~/Library/Logs/GazeVoice.log`.
+`--segment-test file.wav` (run via `open -W -n dist/A-EYE.app --args …`).
+Log: `~/Library/Logs/A-EYE.log`.

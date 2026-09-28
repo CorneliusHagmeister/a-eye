@@ -69,7 +69,7 @@ final class AppleTranscriber: Transcriber {
 }
 
 /// whisper.cpp (`brew install whisper-cpp`) with a ggml model in
-/// ~/Library/Application Support/GazeVoice/models/. Keeps `whisper-server` resident while
+/// ~/Library/Application Support/A-EYE/models/. Keeps `whisper-server` resident while
 /// you're dictating — started on key-down so the model loads while you speak — and stops it
 /// after a few idle minutes so ~700MB isn't held all day. Falls back to the one-shot CLI.
 final class WhisperTranscriber: Transcriber {

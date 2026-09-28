@@ -43,7 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: lifecycle
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        Log.info("GazeVoice starting")
+        Log.info("A-EYE starting")
         if let i = CommandLine.arguments.firstIndex(of: "--transcribe"), i + 1 < CommandLine.arguments.count {
             runTranscribeCLI(CommandLine.arguments[i + 1]); return
         }
@@ -58,7 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             runSegmentTest(CommandLine.arguments[i + 1]); return
         }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "eye", accessibilityDescription: "GazeVoice")
+        statusItem.button?.image = NSImage(systemSymbolName: "eye", accessibilityDescription: "A-EYE")
         statusItem.button?.imagePosition = .imageLeading
         let menu = NSMenu(); menu.delegate = self
         statusItem.menu = menu
@@ -96,7 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ptt.start()
         } else {
             AX.promptForTrust()
-            hud.show("Grant Accessibility to GazeVoice so it can hear the talk key and focus windows", hideAfter: 8)
+            hud.show("Grant Accessibility to A-EYE so it can hear the talk key and focus windows", hideAfter: 8)
             // Global event monitors registered before trust never fire, so wait and re-register.
             Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] t in
                 guard AX.isTrusted else { return }
@@ -619,7 +619,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item(tracker.isRunning ? "Pause camera" : "Resume camera", #selector(toggleCamera)))
         menu.addItem(item("Open recordings folder", #selector(openRecordings)))
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit GazeVoice", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit A-EYE", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
     @objc private func addTargets() { startAdding() }
@@ -706,7 +706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: CLI test hooks
 
-    /// `GazeVoice --commands-test` — runs sample transcripts through the voice-command parser.
+    /// `AEye --commands-test` — runs sample transcripts through the voice-command parser.
     private func runCommandsTest() {
         let cases = [
             "Scratch that.", "Clear the input.", "clear input",
@@ -724,7 +724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exit(0)
     }
 
-    /// `GazeVoice --gaze-fit-test` — simulates a person at a desk (head turns 1/1.4 of the gaze
+    /// `AEye --gaze-fit-test` — simulates a person at a desk (head turns 1/1.4 of the gaze
     /// angle, 1° pose noise), calibrates in one or two postures, then tests in an unseen one.
     private func runGazeFitTest() {
         var rng = SystemRandomNumberGenerator()
@@ -761,7 +761,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exit(0)
     }
 
-    /// `GazeVoice --engine-test <engine-id> file.wav` — plays a 16kHz WAV into an engine in
+    /// `AEye --engine-test <engine-id> file.wav` — plays a 16kHz WAV into an engine in
     /// real time (100ms chunks, like the mic) and logs every event with its timing.
     private func runEngineTest(_ id: String, _ path: String) {
         guard let e = Engines.make(id), let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
@@ -788,7 +788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 300) { Log.info("engine-test timeout"); exit(1) }
     }
 
-    /// `GazeVoice --segment-test file.wav` — replays a 16kHz 16-bit WAV as if live and logs
+    /// `AEye --segment-test file.wav` — replays a 16kHz 16-bit WAV as if live and logs
     /// where phrases would be committed.
     private func runSegmentTest(_ path: String) {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), data.count > 44 else { exit(1) }
@@ -810,7 +810,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exit(0)
     }
 
-    /// `GazeVoice --inspect` — for each target, logs what's under its click point and the
+    /// `AEye --inspect` — for each target, logs what's under its click point and the
     /// text inputs in its window. Diagnoses "focused the window but paste went nowhere".
     private func runInspect() {
         for t in store.targets {
@@ -832,7 +832,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exit(0)
     }
 
-    /// `GazeVoice --mic-test` — opens the chosen mic for 2s, logs device and peak level, exits.
+    /// `AEye --mic-test` — opens the chosen mic for 2s, logs device and peak level, exits.
     private func runMicTest() {
         AVCaptureDevice.requestAccess(for: .audio) { granted in
             DispatchQueue.main.async { [self] in
@@ -852,7 +852,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// `GazeVoice --transcribe file.wav` — transcribes and exits (for testing the speech side).
+    /// `AEye --transcribe file.wav` — transcribes and exits (for testing the speech side).
     private func runTranscribeCLI(_ path: String) {
         Task { @MainActor in
             _ = await AppleTranscriber.requestAuthorization()

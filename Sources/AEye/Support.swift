@@ -2,7 +2,7 @@ import Foundation
 
 enum Log {
     static let url = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Logs/GazeVoice.log")
+        .appendingPathComponent("Library/Logs/A-EYE.log")
     private static let queue = DispatchQueue(label: "log")
     private static let fmt: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f
@@ -24,8 +24,13 @@ enum Log {
 
 enum Paths {
     static let support: URL = {
-        let u = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("GazeVoice")
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let u = base.appendingPathComponent("A-EYE")
+        // Renamed from GazeVoice: bring calibration, recordings and models along.
+        let old = base.appendingPathComponent("GazeVoice")
+        if !FileManager.default.fileExists(atPath: u.path), FileManager.default.fileExists(atPath: old.path) {
+            try? FileManager.default.moveItem(at: old, to: u)
+        }
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
         return u
     }()

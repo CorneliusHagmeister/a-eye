@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "GazeVoice",
+    name: "AEye",
     platforms: [.macOS(.v14)],
     dependencies: [
         // Parakeet on the Neural Engine. Needs a Swift 6 toolchain to build.
@@ -10,9 +10,9 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "GazeVoice",
+            name: "AEye",
             dependencies: [.product(name: "FluidAudio", package: "FluidAudio")],
-            path: "Sources/GazeVoice"
+            path: "Sources/AEye"
         ),
     ]
 )
