@@ -13,6 +13,8 @@ final class Press {
     var phrases = 0
     /// Paste-on-release: the whole text has been queued for delivery.
     var pastedWhole = false
+    /// "…send it" was said: press Return once the whole press has been pasted.
+    var submitRequested = false
     var error: String?
     var wav: URL?
 

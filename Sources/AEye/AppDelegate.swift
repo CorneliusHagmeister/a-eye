@@ -306,12 +306,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .partial(let t):
             if p === press, recordingActive { livePartial = t }
         case .final(let t):
-            let text = p.phrases > 0 ? " " + t : t
-            p.text += text
-            p.phrases += 1
             if p === press { livePartial = "" }
-            // Default: hold everything until release, so nothing half-finished lands in the input.
-            if Settings.pasteWhileSpeaking { delivery.enqueue(.text(text, p)) }
+            if Settings.pasteWhileSpeaking {
+                // Each phrase is pasted as you pause; commands act per phrase ("scratch that"
+                // on its own removes the last pasted phrase).
+                let cmd = VoiceCommands.interpret(t)
+                if cmd.undoLast { delivery.enqueue(.undoLast(p)) }
+                if cmd.clearFirst { delivery.enqueue(.clear(p)) }
+                if cmd.submit { p.submitRequested = true }
+                p.phrases += 1
+                guard !cmd.text.isEmpty else { return }
+                let text = p.text.isEmpty ? cmd.text : " " + cmd.text
+                p.text += text
+                delivery.enqueue(.text(text, p))
+            } else {
+                p.text += p.phrases > 0 ? " " + t : t  // held until release, then interpreted whole
+                p.phrases += 1
+            }
         case .failed(let msg):
             p.error = msg
             Log.info("engine error: \(msg)")
@@ -341,7 +352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func completePress(_ p: Press) {
-        var submit = Settings.autoSubmit && p.phrases > 0
+        var submit = (Settings.autoSubmit || p.submitRequested) && !p.text.isEmpty
         if !Settings.pasteWhileSpeaking, p.phrases > 0, !p.pastedWhole {
             p.pastedWhole = true
             let cmd = VoiceCommands.interpret(p.text)

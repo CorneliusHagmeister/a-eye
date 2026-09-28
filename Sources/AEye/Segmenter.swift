@@ -6,7 +6,7 @@ import Foundation
 /// changes, which is what makes it safe to paste straight into the target.
 final class Segmenter {
     private let frame = 480                  // 30ms at 16kHz
-    private let pauseFrames = 15             // 450ms of quiet ends a phrase
+    private let pauseFrames = 23             // ~0.7s of quiet ends a phrase (shorter split mid-sentence)
     private let minSpeechFrames = 17         // ~0.5s of speech before a phrase can end
     private let maxPhrase = 12 * 16_000      // force a cut in very long run-on speech
     private var noiseFloor: Float = 0.002
