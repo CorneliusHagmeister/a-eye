@@ -57,6 +57,15 @@ enum Settings {
         get { d.object(forKey: "pasteWhileSpeaking") as? Bool ?? true }
         set { d.set(newValue, forKey: "pasteWhileSpeaking") }
     }
+    /// Transcript clean-up before pasting: "off", "basic" (local) or "openai".
+    static var cleanup: String {
+        get { d.string(forKey: "cleanup") ?? "basic" }
+        set { d.set(newValue, forKey: "cleanup") }
+    }
+    static var cleanupModel: String {
+        get { d.string(forKey: "cleanupModel") ?? "gpt-6-luna" }
+        set { d.set(newValue, forKey: "cleanupModel") }
+    }
     static var showGazePointer: Bool {
         get { d.bool(forKey: "showGazePointer") }
         set { d.set(newValue, forKey: "showGazePointer") }

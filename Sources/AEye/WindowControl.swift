@@ -226,7 +226,10 @@ enum Input {
         CGAssociateMouseAndMouseCursorPosition(1)
     }
 
+    private(set) static var lastSyntheticKey = Date.distantPast
+
     static func key(_ code: CGKeyCode, flags: CGEventFlags = []) {
+        lastSyntheticKey = Date()
         for down in [true, false] {
             let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
             e?.flags = flags

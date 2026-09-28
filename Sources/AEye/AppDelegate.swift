@@ -51,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if CommandLine.arguments.contains("--inspect") { runInspect(); return }
         if CommandLine.arguments.contains("--gaze-fit-test") { runGazeFitTest(); return }
         if CommandLine.arguments.contains("--commands-test") { runCommandsTest(); return }
+        if CommandLine.arguments.contains("--cleanup-test") { runCleanupTest(); return }
         if let i = CommandLine.arguments.firstIndex(of: "--engine-test"), i + 2 < CommandLine.arguments.count {
             runEngineTest(CommandLine.arguments[i + 1], CommandLine.arguments[i + 2]); return
         }
@@ -108,6 +109,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
             // You clicked somewhere; don't trust stale focus (our own clicks excepted).
             if Date().timeIntervalSince(Input.lastSyntheticClick) > 0.5 { self?.delivery.focusedTarget = nil }
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] _ in
+            // You typed yourself: stop editing our pasted sentences in place.
+            if Date().timeIntervalSince(Input.lastSyntheticKey) > 0.5, self?.ptt.isHeld == false { self?.delivery.userTyped() }
         }
         prepareElectronTrees()
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification,
@@ -309,16 +314,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if p === press { livePartial = "" }
             if Settings.pasteWhileSpeaking {
                 // Each phrase is pasted as you pause; commands act per phrase ("scratch that"
-                // on its own removes the last pasted phrase).
+                // on its own removes the last pasted phrase). Commands are read from the raw
+                // text so clean-up can't tidy them away.
                 let cmd = VoiceCommands.interpret(t)
+                p.phrases += 1
                 if cmd.undoLast { delivery.enqueue(.undoLast(p)) }
                 if cmd.clearFirst { delivery.enqueue(.clear(p)) }
                 if cmd.submit { p.submitRequested = true }
-                p.phrases += 1
-                guard !cmd.text.isEmpty else { return }
-                let text = p.text.isEmpty ? cmd.text : " " + cmd.text
-                p.text += text
-                delivery.enqueue(.text(text, p))
+                if !cmd.text.isEmpty { pasteSentences(cmd.text, p) }
             } else {
                 p.text += p.phrases > 0 ? " " + t : t  // held until release, then interpreted whole
                 p.phrases += 1
@@ -332,6 +335,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Pastes `text` a sentence at a time, each tidied locally straight away. With OpenAI
+    /// clean-up on, every sentence also goes off in parallel and its cleaned version is
+    /// swapped in place as soon as it comes back.
+    private func pasteSentences(_ text: String, _ p: Press) {
+        for sentence in Self.sentences(text) {
+            let quick = Settings.cleanup == "off" ? sentence : Cleanup.basic(sentence)
+            guard !quick.isEmpty else { continue }
+            let id = UUID()
+            let context = p.text
+            p.text += (p.text.isEmpty ? "" : " ") + quick
+            delivery.enqueue(.text(quick, p, segment: id))
+            guard Settings.cleanup == "openai" else { continue }
+            p.cleanups.append(Task { @MainActor in
+                let cleaned = await Cleanup.openAI(sentence, previous: context)
+                guard !cleaned.isEmpty, cleaned != quick else { return }
+                p.text = p.text.replacingOccurrences(of: quick, with: cleaned)
+                self.delivery.enqueue(.replace(id, cleaned, p))
+            })
+        }
+    }
+
+    static func sentences(_ s: String) -> [String] {
+        var out: [String] = [], cur = ""
+        for ch in s {
+            cur.append(ch)
+            if ".!?".contains(ch) { out.append(cur); cur = "" }
+        }
+        out.append(cur)
+        return out.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
     private func finishPress(_ p: Press) {
         // The cloud engine failed before producing anything: transcribe the saved audio locally.
         if p.phrases == 0, p.error != nil, let wav = p.wav {
@@ -340,9 +374,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let local = Engines.localTranscriber()
                 if let text = try? await local.transcribe(wav: wav, hints: self.sessionContext().hints, previous: ""),
                    !ChunkedSession.clean(text).isEmpty {
-                    p.text = ChunkedSession.clean(text); p.phrases = 1
+                    p.phrases = 1
                     p.pastedWhole = true
-                    self.delivery.enqueue(.text(p.text, p))
+                    self.pasteSentences(ChunkedSession.clean(text), p)
                 }
                 self.completePress(p)
             }
@@ -352,19 +386,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func completePress(_ p: Press) {
+        Task { @MainActor in await self.completePressAsync(p) }
+    }
+
+    private func completePressAsync(_ p: Press) async {
         var submit = (Settings.autoSubmit || p.submitRequested) && !p.text.isEmpty
         if !Settings.pasteWhileSpeaking, p.phrases > 0, !p.pastedWhole {
+            let raw = p.text
+            p.text = ""
             p.pastedWhole = true
-            let cmd = VoiceCommands.interpret(p.text)
-            if cmd.text != p.text || cmd.clearFirst || cmd.undoLast || cmd.submit {
+            let cmd = VoiceCommands.interpret(raw)
+            if cmd.text != raw || cmd.clearFirst || cmd.undoLast || cmd.submit {
                 Log.info("voice command: clear=\(cmd.clearFirst) scratch=\(cmd.undoLast) send=\(cmd.submit) text=\(cmd.text)")
             }
             if cmd.undoLast { delivery.enqueue(.undoLast(p)) }
             if cmd.clearFirst { delivery.enqueue(.clear(p)) }
-            p.text = cmd.text
-            if !cmd.text.isEmpty { delivery.enqueue(.text(cmd.text, p)) }
-            submit = (submit || cmd.submit) && !cmd.text.isEmpty
+            if !cmd.text.isEmpty { pasteSentences(cmd.text, p) }
+            submit = (Settings.autoSubmit || cmd.submit) && !p.text.isEmpty
         }
+        // Send only once every sentence has been swapped for its cleaned version.
+        for t in p.cleanups { await t.value }
         if submit { delivery.enqueue(.submit(p)) }
         if p.state == .undeliverable {
             // Paste-while-speaking: earlier phrases failed; copy the whole text now.
@@ -610,6 +651,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(item("Press Return after pasting", #selector(toggleSubmit), on: Settings.autoSubmit))
         menu.addItem(item("Paste while speaking (at each pause)", #selector(togglePasteWhileSpeaking), on: Settings.pasteWhileSpeaking))
+        let csub = NSMenu()
+        csub.addItem(item("Off — exactly as heard", #selector(chooseCleanup(_:)), "off", on: Settings.cleanup == "off"))
+        csub.addItem(item("Basic — remove fillers (local)", #selector(chooseCleanup(_:)), "basic", on: Settings.cleanup == "basic"))
+        csub.addItem(item("OpenAI \(Settings.cleanupModel)\(Keychain.get("openai") == nil ? " — add API key…" : "")",
+                          #selector(chooseCleanup(_:)), "openai", on: Settings.cleanup == "openai"))
+        let names = ["off": "off", "basic": "basic", "openai": "OpenAI"]
+        let ci = item("Clean-up: \(names[Settings.cleanup] ?? Settings.cleanup)", nil); ci.submenu = csub
+        menu.addItem(ci)
         menu.addItem(item("Show target in menu bar", #selector(toggleMenuBar), on: Settings.showGazeInMenuBar))
 
         let esub = NSMenu()
@@ -648,6 +697,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func removeAll() { store.removeAll() }
     @objc private func toggleSubmit() { Settings.autoSubmit.toggle() }
     @objc private func togglePasteWhileSpeaking() { Settings.pasteWhileSpeaking.toggle() }
+    @objc private func chooseCleanup(_ s: NSMenuItem) {
+        guard let mode = s.representedObject as? String else { return }
+        if mode == "openai", Keychain.get("openai") == nil, !promptForKey("openai") { return }
+        Settings.cleanup = mode
+    }
     @objc private func toggleMenuBar() { Settings.showGazeInMenuBar.toggle(); updateStatusTitle(face: tracker.latest != nil) }
     @objc private func chooseEngine(_ s: NSMenuItem) {
         guard let id = s.representedObject as? String, let e = Engines.make(id) else { return }
@@ -717,6 +771,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: CLI test hooks
 
+    /// `AEye --cleanup-test` — sends sample dictations through OpenAI clean-up (needs the
+    /// OpenAI key in the Keychain) and logs latency and output for each.
+    private func runCleanupTest() {
+        let samples = [
+            "Um so I I think we should, uh, like, run the tests first and then, you know, open the PR.",
+            "Can you check the, the auth middleware, actually no, the rate limiter in VS Code?",
+            "Ähm, kannst du bitte äh die Tests laufen lassen und mir sagen ob der Build grün ist?",
+            "What's the capital of France?",
+        ]
+        Task { @MainActor in
+            for s in samples { _ = await Cleanup.openAI(s, previous: "") }
+            exit(0)
+        }
+    }
+
     /// `AEye --commands-test` — runs sample transcripts through the voice-command parser.
     private func runCommandsTest() {
         let cases = [
@@ -728,6 +797,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "Can you clear the input field in the form component?",
             "Refactor the parser, scratch that, rewrite the parser.",
         ]
+        for c in ["Um, so I I think we should, uh, run the tests.", "Ähm, kannst du äh die Tests laufen lassen?",
+                  "Do I need to restart um the the tool though?", "The umbrella summary is humble."] {
+            Log.info("basic cleanup: \(c)\n    → \(Cleanup.basic(c))")
+        }
         for c in cases {
             let r = VoiceCommands.interpret(c)
             Log.info("\(c)\n    → text=\"\(r.text)\" clear=\(r.clearFirst) scratch=\(r.undoLast) send=\(r.submit)")

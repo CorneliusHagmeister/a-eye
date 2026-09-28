@@ -15,6 +15,8 @@ final class Press {
     var pastedWhole = false
     /// "…send it" was said: press Return once the whole press has been pasted.
     var submitRequested = false
+    /// In-flight OpenAI clean-ups; Return ("send it") waits for them so it sends the clean text.
+    var cleanups: [Task<Void, Never>] = []
     var error: String?
     var wav: URL?
 
@@ -22,22 +24,34 @@ final class Press {
 }
 
 /// Pastes committed text strictly in order, each piece into its press's target.
+///
+/// Every sentence pasted into the current box is remembered as a segment, so a cleaned-up
+/// version can be swapped in afterwards (delete back to it, retype it and anything after
+/// it) and "scratch that" can remove exactly the last one. Segments are dropped the moment
+/// you click or type yourself — then the caret may have moved and editing blind is unsafe.
 final class Delivery {
-    enum Job { case text(String, Press), submit(Press), clear(Press), undoLast(Press) }
+    enum Job {
+        case text(String, Press, segment: UUID?)
+        case replace(UUID, String, Press)
+        case submit(Press), clear(Press), undoLast(Press)
+    }
 
     /// Target the user is recording for right now — delivery returns there after a hop.
     var currentFocusTarget: () -> Target? = { nil }
     var onDelivered: ((Press, String) -> Void)?
     /// The target's window is gone (closed / other Space); the text was not pasted anywhere.
     var onUndeliverable: ((Press) -> Void)?
+    var onCommandDone: ((Press, String) -> Void)?
     /// Target we last focused and nothing has moved focus since — skip the refocus.
-    var focusedTarget: String?
+    var focusedTarget: String? {
+        didSet { if focusedTarget == nil { segments = [] } }
+    }
     private(set) var recent: [Press] = []
     private var queue: [Job] = []
     private var running = false
-    /// What we pasted last and where — "scratch that" deletes exactly this.
-    private var lastPaste: (key: String, count: Int)?
-    var onCommandDone: ((Press, String) -> Void)?
+    /// What we've pasted, in order, into the box `segmentsKey` since focus last changed.
+    private var segments: [(id: UUID, text: String)] = []
+    private var segmentsKey: String?
 
     var pending: Int { queue.count }
 
@@ -47,6 +61,9 @@ final class Delivery {
     }
 
     func forget(_ p: Press) { recent.removeAll { $0 === p } }
+
+    /// You typed in some app yourself: our picture of the box's contents is no longer reliable.
+    func userTyped() { segments = [] }
 
     func enqueue(_ job: Job) {
         queue.append(job)
@@ -60,40 +77,55 @@ final class Delivery {
         defer { running = false }
         while !queue.isEmpty {
             switch queue.removeFirst() {
-            case .text(var text, let press):
+            case .text(var text, let press, let id):
                 guard press.state != .undeliverable else { continue }  // collected, copied at the end
                 let key = press.target?.key ?? "front"
+                if segmentsKey != key { segments = [] }
                 // A second dictation into the same box continues the text.
-                if lastPaste?.key == key, !text.hasPrefix(" ") { text = " " + text }
-                if await deliver(text, to: press.target, submit: false) {
-                    lastPaste = (key, text.count)
+                if !segments.isEmpty, !text.hasPrefix(" ") { text = " " + text }
+                if await deliver(text, to: press.target) {
+                    if segmentsKey != key { segments = [] }  // deliver() may have refocused
+                    segments.append((id ?? UUID(), text))
+                    segmentsKey = key
                     onDelivered?(press, text)
                 } else {
                     press.state = .undeliverable
                     onUndeliverable?(press)
                 }
+            case .replace(let id, var text, let press):
+                let key = press.target?.key ?? "front"
+                // Only while the caret is where we left it: same box, nothing typed or clicked since.
+                guard segmentsKey == key, focusedTarget == key || press.target == nil,
+                      let i = segments.firstIndex(where: { $0.id == id }), segments[i].text != text else { continue }
+                if segments[i].text.hasPrefix(" "), !text.hasPrefix(" ") { text = " " + text }
+                let tail = segments[i...]
+                let count = tail.reduce(0) { $0 + $1.text.count }
+                guard count <= 3000, await deliver(nil, to: press.target) else { continue }
+                for _ in 0..<count { Input.key(51) }  // ⌫ back to the start of that sentence
+                segments[i].text = text
+                await Input.paste(segments[i...].map(\.text).joined(), submit: false)
             case .submit(let press):
                 if press.state != .undeliverable { _ = await deliver(nil, to: press.target, submit: true) }
-                lastPaste = nil
+                segments = []
             case .undoLast(let press):
                 let key = press.target?.key ?? "front"
-                guard let last = lastPaste, last.key == key, last.count <= 4000 else {
+                guard segmentsKey == key, let last = segments.last, last.text.count <= 4000 else {
                     onCommandDone?(press, "Nothing to scratch here"); continue
                 }
-                if await deliver(nil, to: press.target, submit: false) {
-                    for _ in 0..<last.count { Input.key(51) }  // ⌫ — caret is still at the end of our paste
-                    lastPaste = nil
-                    onCommandDone?(press, "⌫ Scratched the last dictation")
+                if await deliver(nil, to: press.target) {
+                    for _ in 0..<last.text.count { Input.key(51) }  // ⌫ — caret is at the end of our paste
+                    segments.removeLast()
+                    onCommandDone?(press, "⌫ Scratched “\(last.text.trimmingCharacters(in: .whitespaces).prefix(40))”")
                 }
             case .clear(let press):
                 // Only a detected text input — ⌘A in a code editor would select the whole file.
                 guard press.target == nil || press.target?.clickFraction != nil else {
                     onCommandDone?(press, "No text input found there — not clearing"); continue
                 }
-                if await deliver(nil, to: press.target, submit: false) {
+                if await deliver(nil, to: press.target) {
                     Input.key(0, flags: .maskCommand)  // ⌘A
                     Input.key(51)                      // ⌫
-                    lastPaste = nil
+                    segments = []
                     onCommandDone?(press, "Cleared the input")
                 }
             }
@@ -101,7 +133,7 @@ final class Delivery {
     }
 
     @MainActor
-    private func deliver(_ text: String?, to target: Target?, submit: Bool) async -> Bool {
+    private func deliver(_ text: String?, to target: Target?, submit: Bool = false) async -> Bool {
         guard let target else {  // no targets set up: plain dictation into the focused app
             if let text { await Input.paste(text, submit: false) }
             if submit { Input.key(36) }
