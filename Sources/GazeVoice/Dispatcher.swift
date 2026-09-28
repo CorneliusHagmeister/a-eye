@@ -21,7 +21,7 @@ final class Press {
 
 /// Pastes committed text strictly in order, each piece into its press's target.
 final class Delivery {
-    enum Job { case text(String, Press), submit(Press) }
+    enum Job { case text(String, Press), submit(Press), clear(Press), undoLast(Press) }
 
     /// Target the user is recording for right now — delivery returns there after a hop.
     var currentFocusTarget: () -> Target? = { nil }
@@ -33,6 +33,9 @@ final class Delivery {
     private(set) var recent: [Press] = []
     private var queue: [Job] = []
     private var running = false
+    /// What we pasted last and where — "scratch that" deletes exactly this.
+    private var lastPaste: (key: String, count: Int)?
+    var onCommandDone: ((Press, String) -> Void)?
 
     var pending: Int { queue.count }
 
@@ -55,9 +58,13 @@ final class Delivery {
         defer { running = false }
         while !queue.isEmpty {
             switch queue.removeFirst() {
-            case .text(let text, let press):
+            case .text(var text, let press):
                 guard press.state != .undeliverable else { continue }  // collected, copied at the end
+                let key = press.target?.key ?? "front"
+                // A second dictation into the same box continues the text.
+                if lastPaste?.key == key, !text.hasPrefix(" ") { text = " " + text }
                 if await deliver(text, to: press.target, submit: false) {
+                    lastPaste = (key, text.count)
                     onDelivered?(press, text)
                 } else {
                     press.state = .undeliverable
@@ -65,6 +72,28 @@ final class Delivery {
                 }
             case .submit(let press):
                 if press.state != .undeliverable { _ = await deliver(nil, to: press.target, submit: true) }
+                lastPaste = nil
+            case .undoLast(let press):
+                let key = press.target?.key ?? "front"
+                guard let last = lastPaste, last.key == key, last.count <= 4000 else {
+                    onCommandDone?(press, "Nothing to scratch here"); continue
+                }
+                if await deliver(nil, to: press.target, submit: false) {
+                    for _ in 0..<last.count { Input.key(51) }  // ⌫ — caret is still at the end of our paste
+                    lastPaste = nil
+                    onCommandDone?(press, "⌫ Scratched the last dictation")
+                }
+            case .clear(let press):
+                // Only a detected text input — ⌘A in a code editor would select the whole file.
+                guard press.target == nil || press.target?.clickFraction != nil else {
+                    onCommandDone?(press, "No text input found there — not clearing"); continue
+                }
+                if await deliver(nil, to: press.target, submit: false) {
+                    Input.key(0, flags: .maskCommand)  // ⌘A
+                    Input.key(51)                      // ⌫
+                    lastPaste = nil
+                    onCommandDone?(press, "Cleared the input")
+                }
             }
         }
     }

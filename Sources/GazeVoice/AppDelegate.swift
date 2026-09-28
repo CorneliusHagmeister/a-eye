@@ -49,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if CommandLine.arguments.contains("--mic-test") { runMicTest(); return }
         if CommandLine.arguments.contains("--inspect") { runInspect(); return }
         if CommandLine.arguments.contains("--gaze-fit-test") { runGazeFitTest(); return }
+        if CommandLine.arguments.contains("--commands-test") { runCommandsTest(); return }
         if let i = CommandLine.arguments.firstIndex(of: "--engine-test"), i + 2 < CommandLine.arguments.count {
             runEngineTest(CommandLine.arguments[i + 1], CommandLine.arguments[i + 2]); return
         }
@@ -333,11 +334,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func completePress(_ p: Press) {
+        var submit = Settings.autoSubmit && p.phrases > 0
         if !Settings.pasteWhileSpeaking, p.phrases > 0, !p.pastedWhole {
             p.pastedWhole = true
-            delivery.enqueue(.text(p.text, p))
+            let cmd = VoiceCommands.interpret(p.text)
+            if cmd.text != p.text || cmd.clearFirst || cmd.undoLast || cmd.submit {
+                Log.info("voice command: clear=\(cmd.clearFirst) scratch=\(cmd.undoLast) send=\(cmd.submit) text=\(cmd.text)")
+            }
+            if cmd.undoLast { delivery.enqueue(.undoLast(p)) }
+            if cmd.clearFirst { delivery.enqueue(.clear(p)) }
+            p.text = cmd.text
+            if !cmd.text.isEmpty { delivery.enqueue(.text(cmd.text, p)) }
+            submit = (submit || cmd.submit) && !cmd.text.isEmpty
         }
-        if Settings.autoSubmit, p.phrases > 0 { delivery.enqueue(.submit(p)) }
+        if submit { delivery.enqueue(.submit(p)) }
         if p.state == .undeliverable {
             // Paste-while-speaking: earlier phrases failed; copy the whole text now.
             NSPasteboard.general.clearContents()
@@ -389,6 +399,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(p.text, forType: .string)
             self?.hud.show("⚠︎ Couldn't find \(p.target?.name ?? "the window") — text copied to clipboard", hideAfter: 3)
+        }
+        delivery.onCommandDone = { [weak self] p, message in
+            guard let self, !self.recordingActive else { return }
+            self.showHUD(message, for: p.target, hideAfter: 1.5)
         }
         delivery.onDelivered = { [weak self] p, text in
             guard let self, !self.recordingActive else { return }
@@ -681,6 +695,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: CLI test hooks
+
+    /// `GazeVoice --commands-test` — runs sample transcripts through the voice-command parser.
+    private func runCommandsTest() {
+        let cases = [
+            "Scratch that.", "Clear the input.", "clear input",
+            "Let's use Redis. Scratch that. Let's use Postgres instead.",
+            "Scratch that. Try the other branch.",
+            "Clear the input. Can you run the tests?",
+            "Can you run the tests and open a PR, send it.",
+            "Can you clear the input field in the form component?",
+            "Refactor the parser, scratch that, rewrite the parser.",
+        ]
+        for c in cases {
+            let r = VoiceCommands.interpret(c)
+            Log.info("\(c)\n    → text=\"\(r.text)\" clear=\(r.clearFirst) scratch=\(r.undoLast) send=\(r.submit)")
+        }
+        exit(0)
+    }
 
     /// `GazeVoice --gaze-fit-test` — fits the screen model on synthetic data with a known
     /// head-pose → screen mapping plus noise, and checks the error it reports.
