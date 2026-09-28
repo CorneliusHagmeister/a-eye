@@ -17,6 +17,12 @@ struct Target: Codable, Identifiable, Equatable {
     var pitch: Double
     var spread: Double
 
+    /// Same window + same spot = same destination, even for targets made fresh per key press.
+    var key: String {
+        let c = clickFraction.map { "\(Int($0.x * 20)),\(Int($0.y * 20))" } ?? "-"
+        return "\(bundleID)|\(Int(windowFrame.minX)),\(Int(windowFrame.minY)),\(Int(windowFrame.width))|\(c)"
+    }
+
     func clickPoint(in frame: CGRect) -> CGPoint? {
         clickFraction.map { CGPoint(x: frame.minX + $0.x * frame.width, y: frame.minY + $0.y * frame.height) }
     }

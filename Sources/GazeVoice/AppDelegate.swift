@@ -339,9 +339,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if Settings.autoSubmit, p.phrases > 0 { delivery.enqueue(.submit(p)) }
         if p.state == .undeliverable {
+            // Paste-while-speaking: earlier phrases failed; copy the whole text now.
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(p.text, forType: .string)
-            hud.show("⚠︎ Couldn't find \(p.target?.name ?? "the window") — text copied to clipboard", hideAfter: 3)
         } else if p.phrases == 0 {
             p.state = p.error == nil ? .empty : .failed
             if !recordingActive { showHUD(p.error == nil ? "(nothing heard)" : "⚠︎ Failed — audio kept, retry from Recent",
@@ -384,6 +384,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         delivery.currentFocusTarget = { [weak self] in
             guard let self, self.ptt.isHeld else { return nil }
             return self.latched
+        }
+        delivery.onUndeliverable = { [weak self] p in
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(p.text, forType: .string)
+            self?.hud.show("⚠︎ Couldn't find \(p.target?.name ?? "the window") — text copied to clipboard", hideAfter: 3)
         }
         delivery.onDelivered = { [weak self] p, text in
             guard let self, !self.recordingActive else { return }

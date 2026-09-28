@@ -26,8 +26,10 @@ final class Delivery {
     /// Target the user is recording for right now — delivery returns there after a hop.
     var currentFocusTarget: () -> Target? = { nil }
     var onDelivered: ((Press, String) -> Void)?
+    /// The target's window is gone (closed / other Space); the text was not pasted anywhere.
+    var onUndeliverable: ((Press) -> Void)?
     /// Target we last focused and nothing has moved focus since — skip the refocus.
-    var focusedTarget: UUID?
+    var focusedTarget: String?
     private(set) var recent: [Press] = []
     private var queue: [Job] = []
     private var running = false
@@ -59,6 +61,7 @@ final class Delivery {
                     onDelivered?(press, text)
                 } else {
                     press.state = .undeliverable
+                    onUndeliverable?(press)
                 }
             case .submit(let press):
                 if press.state != .undeliverable { _ = await deliver(nil, to: press.target, submit: true) }
@@ -74,21 +77,21 @@ final class Delivery {
             return true
         }
         let returnTo = currentFocusTarget()
-        let alreadyThere = focusedTarget == target.id
+        let alreadyThere = focusedTarget == target.key
             && WindowControl.resolve(target)?.pid == WindowControl.frontmostPID()
         if !alreadyThere {
             // Window closed or on another Space: never paste into whatever happens to be in front.
             guard await WindowControl.focus(target, click: true) else { return false }
-            focusedTarget = target.id
+            focusedTarget = target.key
             try? await Task.sleep(nanoseconds: 120_000_000)
         }
         if let text { await Input.paste(text, submit: false) }
         if submit { Input.key(36) }
         // You've moved on to another target while this was in flight — hop back.
-        if let back = returnTo, back.id != target.id {
+        if let back = returnTo, back.key != target.key {
             try? await Task.sleep(nanoseconds: 150_000_000)
             await WindowControl.focus(back, click: true)
-            focusedTarget = back.id
+            focusedTarget = back.key
         }
         return true
     }
