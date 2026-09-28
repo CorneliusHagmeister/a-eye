@@ -32,6 +32,42 @@ enum AX {
         return CGRect(origin: p, size: s)
     }
 
+    static func role(_ el: AXUIElement) -> String { string(el, kAXRoleAttribute) ?? "?" }
+
+    static func children(_ el: AXUIElement) -> [AXUIElement] {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &v) == .success else { return [] }
+        return (v as? [AXUIElement]) ?? []
+    }
+
+    static func element(at p: CGPoint) -> AXUIElement? {
+        var el: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(p.x), Float(p.y), &el) == .success
+        else { return nil }
+        return el
+    }
+
+    /// Electron apps (VS Code, Claude, Discord, Cursor) only build their accessibility tree
+    /// when asked; without this, windows look empty below the top level.
+    static func enableElectronTree(_ pid: pid_t) {
+        AXUIElementSetAttributeValue(AXUIElementCreateApplication(pid), "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    }
+
+    /// Editable text elements under `root` (breadth-first, bounded).
+    static func textInputs(in root: AXUIElement, limit: Int = 4000) -> [(AXUIElement, CGRect)] {
+        var out: [(AXUIElement, CGRect)] = []
+        var queue = [root], seen = 0
+        while !queue.isEmpty, seen < limit {
+            let el = queue.removeFirst(); seen += 1
+            let r = role(el)
+            if r == kAXTextAreaRole || r == kAXTextFieldRole, let f = frame(el), f.width > 20, f.height > 8 {
+                out.append((el, f))
+            }
+            queue.append(contentsOf: children(el))
+        }
+        return out
+    }
+
     static var primaryScreenHeight: CGFloat { NSScreen.screens.first?.frame.height ?? 0 }
 
     /// Current mouse location in top-left coords.
@@ -83,7 +119,8 @@ enum WindowControl {
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         let savedSuffix = suffix(t.windowTitle)
         var best: (WindowRef, Double)?
-        for win in AX.windows(axApp) {
+        let windows = AX.windows(axApp)
+        for win in windows {
             guard let frame = AX.frame(win), frame.width > 50 else { continue }
             let title = AX.string(win, kAXTitleAttribute) ?? ""
             var score = 0.0
@@ -93,7 +130,10 @@ enum WindowControl {
             let ref = WindowRef(pid: app.processIdentifier, app: app, window: win, frame: frame, title: title)
             if best == nil || score > best!.1 { best = (ref, score) }
         }
-        return best?.0
+        // A zero score means "some other window of this app" — the real one is closed or on
+        // another Space. Better to fail than to paste into the wrong window.
+        guard let (ref, score) = best, score >= 2 || windows.count == 1 else { return nil }
+        return ref
     }
 
     /// Brings the target's window to the front. With `click`, also clicks the stored point so
@@ -105,11 +145,53 @@ enum WindowControl {
         AXUIElementSetAttributeValue(axApp, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
         AXUIElementPerformAction(ref.window, kAXRaiseAction as CFString)
         AXUIElementSetAttributeValue(ref.window, kAXMainAttribute as CFString, kCFBooleanTrue)
-        if click, let p = t.clickPoint(in: ref.frame) {
-            try? await Task.sleep(nanoseconds: 90_000_000)  // let the raise land before clicking
-            await Input.click(at: p)
+        guard click else { return true }
+        AX.enableElectronTree(ref.pid)
+        let hint = t.clickPoint(in: ref.frame) ?? CGPoint(x: ref.frame.midX, y: ref.frame.midY)
+        try? await Task.sleep(nanoseconds: 90_000_000)  // let the raise land
+        // Chat inputs move (Claude's composer sits mid-window in a new chat, at the bottom
+        // once there's a conversation), so prefer the text input nearest the calibrated point.
+        if let (input, f) = nearestInput(to: hint, in: ref.window) {
+            AXUIElementSetAttributeValue(input, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            try? await Task.sleep(nanoseconds: 60_000_000)
+            if !isFocused(input, pid: ref.pid) {
+                await Input.click(at: CGPoint(x: f.maxX - 12, y: f.maxY - 8))  // end of the text
+            }
+            return true
         }
+        await Input.click(at: hint)
         return true
+    }
+
+    /// The editable text element closest to `p`: search outwards from whatever is under the
+    /// point (cheap), then the whole window.
+    static func nearestInput(to p: CGPoint, in window: AXUIElement, maxDistance: CGFloat = 250) -> (AXUIElement, CGRect)? {
+        func best(_ c: [(AXUIElement, CGRect)]) -> (AXUIElement, CGRect)? {
+            let scored: [((AXUIElement, CGRect), CGFloat)] = c.map { ($0, distance(p, $0.1)) }
+            return scored.filter { $0.1 <= maxDistance }.min { $0.1 < $1.1 }?.0
+        }
+        var el = AX.element(at: p)
+        for _ in 0..<12 {
+            guard let cur = el else { break }
+            if let hit = best(AX.textInputs(in: cur, limit: 400)) { return hit }
+            var parent: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(cur, kAXParentAttribute as CFString, &parent) == .success,
+                  let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+            el = (parent as! AXUIElement)
+        }
+        return best(AX.textInputs(in: window, limit: 3000))
+    }
+
+    private static func isFocused(_ el: AXUIElement, pid: pid_t) -> Bool {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute as CFString, &v) == .success,
+              let v else { return false }
+        return CFEqual(v, el)
+    }
+
+    private static func distance(_ p: CGPoint, _ r: CGRect) -> CGFloat {
+        let dx = max(r.minX - p.x, 0, p.x - r.maxX), dy = max(r.minY - p.y, 0, p.y - r.maxY)
+        return (dx * dx + dy * dy).squareRoot()
     }
 
     static func frontmostPID() -> pid_t? { NSWorkspace.shared.frontmostApplication?.processIdentifier }
@@ -129,8 +211,11 @@ enum WindowControl {
 /// (Right ⌥) doesn't turn our click into an Option-click (= add cursor in VS Code).
 enum Input {
     private static let source = CGEventSource(stateID: .privateState)
+    /// So our own clicks don't look like "the user clicked somewhere else".
+    private(set) static var lastSyntheticClick = Date.distantPast
 
     static func click(at p: CGPoint) async {
+        lastSyntheticClick = Date()
         let back = AX.mouseLocation
         for type in [CGEventType.leftMouseDown, .leftMouseUp] {
             let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: .left)

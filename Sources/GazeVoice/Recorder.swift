@@ -39,6 +39,13 @@ final class Recorder {
         }
     }
 
+    /// Audio recorded so far, from `start` on (index into the current recording).
+    func samples(from start: Int) -> [Float] {
+        lock.lock(); defer { lock.unlock() }
+        guard let r = recording, start < r.count else { return [] }
+        return Array(r[start...])
+    }
+
     func cancel() {
         lock.lock(); recording = nil; lock.unlock()
         scheduleCoolDown()

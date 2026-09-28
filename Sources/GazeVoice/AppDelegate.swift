@@ -16,6 +16,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var latched: Target?
     private var latchUntil = Date.distantPast
     private var meter: Timer?
+    private var recordingActive = false
+    private let segmenter = Segmenter()
+    private var phrasesSent = 0
 
     // Calibration state
     private enum CalMode { case none, add, recalibrate([UUID]) }
@@ -32,6 +35,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             runTranscribeCLI(CommandLine.arguments[i + 1]); return
         }
         if CommandLine.arguments.contains("--mic-test") { runMicTest(); return }
+        if CommandLine.arguments.contains("--inspect") { runInspect(); return }
+        if let i = CommandLine.arguments.firstIndex(of: "--segment-test"), i + 1 < CommandLine.arguments.count {
+            runSegmentTest(CommandLine.arguments[i + 1]); return
+        }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "eye", accessibilityDescription: "GazeVoice")
         statusItem.button?.imagePosition = .imageLeading
@@ -85,8 +92,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
-            self?.dispatcher.focusedTarget = nil  // you clicked somewhere; don't trust stale focus
+            // You clicked somewhere; don't trust stale focus (our own clicks excepted).
+            if Date().timeIntervalSince(Input.lastSyntheticClick) > 0.5 { self?.dispatcher.focusedTarget = nil }
         }
+        prepareElectronTrees()
     }
 
     // MARK: gaze
@@ -129,27 +138,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do { try recorder.begin() } catch {
             hud.show("⚠︎ Mic: \(error.localizedDescription)", hideAfter: 3); return
         }
+        recordingActive = true
+        segmenter.reset()
+        phrasesSent = 0
         if let t = latched { Task { await WindowControl.focus(t, click: false) } }
         Log.info("talk ↓ → \(latched?.name ?? "front app")")
         meter?.invalidate()
-        meter = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.showRecordingHUD() }
+        var tick = 0
+        meter = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.showRecordingHUD()
+            tick += 1
+            if tick % 2 == 0 { self?.commitFinishedPhrase() }
+        }
         showRecordingHUD()
     }
 
+    /// While the key is held: when you pause, send the phrase so far off to be transcribed
+    /// and pasted — you see text arriving as you talk instead of all at the end.
+    private func commitFinishedPhrase() {
+        guard recordingActive, Date() >= latchUntil else { return }
+        let s = recorder.samples(from: segmenter.cut)
+        guard let end = segmenter.findPhraseEnd(s) else { return }
+        segmenter.advance(by: end)
+        let phrase = Array(s[..<end])
+        guard segmenter.hasSpeech(phrase) else { return }
+        Log.info(String(format: "phrase %d committed (%.1fs)", phrasesSent + 1, Double(end) / Recorder.sampleRate))
+        dispatcher.submit(samples: phrase, target: latched, continuation: phrasesSent > 0, isFinal: false)
+        phrasesSent += 1
+    }
+
     private func keyUp(_ held: TimeInterval) {
-        if case .none = calMode {} else { return }
+        guard recordingActive else { return }  // e.g. the release of a calibration tap
+        recordingActive = false
         meter?.invalidate(); meter = nil
         let target = latched
         Log.info(String(format: "talk ↑ after %.1fs", held))
         showHUD("… \(target?.name ?? "transcribing")", for: target)
         recorder.end { [weak self] samples in
             guard let self else { return }
-            self.dispatcher.submit(samples: samples, target: target)
+            let rest = self.segmenter.cut < samples.count ? Array(samples[self.segmenter.cut...]) : []
+            if self.segmenter.hasSpeech(rest) {
+                self.dispatcher.submit(samples: rest, target: target, continuation: self.phrasesSent > 0)
+            } else if self.phrasesSent == 0 {
+                self.showHUD("(nothing heard)", for: target, hideAfter: 1.2)
+            } else {
+                self.hud.hide()
+            }
         }
     }
 
     private func keyCancel() {
-        if case .none = calMode {} else { return }
+        guard recordingActive else { return }
+        recordingActive = false
         meter?.invalidate(); meter = nil
         recorder.cancel()
         hud.hide()
@@ -192,10 +232,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.showHUD("✓ \(u.target?.name ?? "pasted"): \(u.text.prefix(48))", for: u.target, hideAfter: 1.6)
             case .failed:
                 self.showHUD("⚠︎ Transcription failed — audio kept, retry from the menu", for: u.target, hideAfter: 3)
+            case .undeliverable:
+                self.hud.show("⚠︎ Couldn't find \(u.target?.name ?? "the window") — text copied to clipboard", hideAfter: 3)
             case .empty:
                 self.showHUD("(nothing heard)", for: u.target, hideAfter: 1.2)
             default: break
             }
+        }
+    }
+
+    /// Electron apps build their accessibility tree lazily and slowly the first time; ask
+    /// early so the first delivery can find the text input.
+    private func prepareElectronTrees() {
+        for id in Set(store.targets.map(\.bundleID)) {
+            NSRunningApplication.runningApplications(withBundleIdentifier: id).forEach { AX.enableElectronTree($0.processIdentifier) }
         }
     }
 
@@ -284,6 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                            yaw: yaw, pitch: pitch, spread: spread)
             t.name = uniqueName(for: t)
             store.upsert(t)
+            AX.enableElectronTree(w.pid)
             hud.show("✓ Added \(t.name) (yaw \(Int(yaw))°) — next target, or Esc when done")
         case .recalibrate(var ids):
             if var t = store.target(ids.first) {
@@ -350,6 +401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .failed: label = "⚠︎ failed — click to retry"
                 case .transcribing: label = "… transcribing"
                 case .empty: label = "(nothing heard)"
+                case .undeliverable: label = "not delivered — click to copy: \(u.text.prefix(40))"
                 default: label = String(u.text.prefix(60))
                 }
                 sub.addItem(item("\(u.target?.name ?? "—"): \(label)", #selector(recentClicked(_:)), u))
@@ -403,6 +455,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: CLI test hooks
+
+    /// `GazeVoice --segment-test file.wav` — replays a 16kHz 16-bit WAV as if live and logs
+    /// where phrases would be committed.
+    private func runSegmentTest(_ path: String) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), data.count > 44 else { exit(1) }
+        let all: [Float] = data.dropFirst(44).withUnsafeBytes { raw in
+            raw.bindMemory(to: Int16.self).map { Float($0) / 32767 }
+        }
+        let seg = Segmenter()
+        var fed = 0
+        while fed < all.count {
+            fed = min(all.count, fed + 3200)  // 200ms ticks, like the live timer
+            let s = Array(all[seg.cut..<fed])
+            if let end = seg.findPhraseEnd(s) {
+                Log.info(String(format: "commit %.2fs–%.2fs (speech: %@)", Double(seg.cut) / 16000,
+                                Double(seg.cut + end) / 16000, seg.hasSpeech(Array(s[..<end])) ? "yes" : "no"))
+                seg.advance(by: end)
+            }
+        }
+        Log.info(String(format: "final %.2fs–%.2fs", Double(seg.cut) / 16000, Double(all.count) / 16000))
+        exit(0)
+    }
+
+    /// `GazeVoice --inspect` — for each target, logs what's under its click point and the
+    /// text inputs in its window. Diagnoses "focused the window but paste went nowhere".
+    private func runInspect() {
+        for t in store.targets {
+            guard let ref = WindowControl.resolve(t) else { Log.info("inspect \(t.name): window not found"); continue }
+            AX.enableElectronTree(ref.pid)
+            let p = t.clickPoint(in: ref.frame) ?? .zero
+            Log.info("inspect \(t.name): window '\(ref.title)' \(ref.frame), click \(p)")
+            // Electron builds the tree lazily after the flag is set.
+            for _ in 0..<6 where AX.textInputs(in: ref.window).isEmpty {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+            }
+            if let el = AX.element(at: p) {
+                Log.info("  at click: \(AX.role(el)) '\(AX.string(el, kAXDescriptionAttribute) ?? "")' \(AX.frame(el) ?? .zero)")
+            }
+            for (el, f) in AX.textInputs(in: ref.window) {
+                Log.info("  input: \(AX.role(el)) '\(AX.string(el, kAXDescriptionAttribute) ?? AX.string(el, kAXPlaceholderValueAttribute) ?? "")' \(f)")
+            }
+        }
+        exit(0)
+    }
 
     /// `GazeVoice --mic-test` — opens the chosen mic for 2s, logs device and peak level, exits.
     private func runMicTest() {

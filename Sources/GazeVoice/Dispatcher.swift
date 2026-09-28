@@ -3,16 +3,22 @@ import AppKit
 /// One press of the talk key. Audio is on disk before transcription starts, so nothing is
 /// lost if transcription is slow, fails, or the app quits.
 final class Utterance {
-    enum State { case transcribing, ready, delivered, failed, empty }
+    enum State { case transcribing, ready, delivered, failed, empty, undeliverable }
     let id = UUID()
     let target: Target?
     let wav: URL
+    /// A later phrase of the same key press — pasted with a leading space.
+    var continuation = false
+    /// The phrase closed by releasing the key (the last one of the press).
+    var isFinal = true
     let created = Date()
     var state: State = .transcribing
     var text = ""
     var error: String?
 
-    init(target: Target?, wav: URL) { self.target = target; self.wav = wav }
+    init(target: Target?, wav: URL, continuation: Bool) {
+        self.target = target; self.wav = wav; self.continuation = continuation
+    }
 }
 
 /// Transcribes utterances one at a time and delivers them strictly in the order they were
@@ -34,11 +40,14 @@ final class Dispatcher {
     init(transcriber: Transcriber) { self.transcriber = transcriber }
 
     var inFlight: Int { pending.count }
+    /// Last transcript, fed to Whisper as context so phrase n+1 continues phrase n.
+    private var lastText = ""
 
-    func submit(samples: [Float], target: Target?) {
+    func submit(samples: [Float], target: Target?, continuation: Bool = false, isFinal: Bool = true) {
         let url = Paths.recordings.appendingPathComponent(Self.stamp() + ".wav")
         do { try WAV.write(samples, to: url) } catch { Log.info("wav write failed: \(error)"); return }
-        let u = Utterance(target: target, wav: url)
+        let u = Utterance(target: target, wav: url, continuation: continuation)
+        u.isFinal = isFinal
         pending.append(u)
         recent.insert(u, at: 0); if recent.count > 10 { recent.removeLast() }
         onUpdate?(u)
@@ -61,9 +70,11 @@ final class Dispatcher {
             await prev?.value
             let t0 = Date()
             do {
-                let text = try await transcriber.transcribe(wav: u.wav, hints: hints)
-                u.text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let context = u.continuation ? [String(self.lastText.suffix(200))] : []
+                let text = try await transcriber.transcribe(wav: u.wav, hints: hints + context)
+                u.text = Self.dropHallucination(text.trimmingCharacters(in: .whitespacesAndNewlines))
                 u.state = u.text.isEmpty ? .empty : .ready
+                if !u.text.isEmpty { self.lastText = u.text }
                 Log.info(String(format: "transcribed in %.2fs → %@: %@", Date().timeIntervalSince(t0),
                                 u.target?.name ?? "front app", u.text))
             } catch {
@@ -83,34 +94,49 @@ final class Dispatcher {
         while let u = pending.first, u.state != .transcribing {
             pending.removeFirst()
             guard u.state == .ready else { continue }
-            await deliver(u)
-            u.state = .delivered
+            u.state = await deliver(u) ? .delivered : .undeliverable
             appendHistory(u)
             onUpdate?(u)
         }
     }
 
+    /// Whisper's stock phrases for near-silence.
+    private static func dropHallucination(_ s: String) -> String {
+        let junk: Set<String> = ["thank you.", "thank you", "thanks for watching!", "thanks for watching.",
+                                 "you", "bye.", "vielen dank.", "untertitel der amara.org-community"]
+        return junk.contains(s.lowercased()) ? "" : s
+    }
+
     @MainActor
-    private func deliver(_ u: Utterance) async {
+    private func deliver(_ u: Utterance) async -> Bool {
+        let text = u.continuation ? " " + u.text : u.text
+        // Send only on the last phrase — the key-up one — never mid-sentence.
+        let submit = Settings.autoSubmit && u.isFinal
         guard let target = u.target else {
-            await Input.paste(u.text, submit: Settings.autoSubmit)  // no targets: plain dictation
-            return
+            await Input.paste(text, submit: submit)  // no targets: plain dictation
+            return true
         }
         let returnTo = currentFocusTarget()
         let alreadyThere = focusedTarget == target.id
             && WindowControl.resolve(target)?.pid == WindowControl.frontmostPID()
         if !alreadyThere {
-            await WindowControl.focus(target, click: true)
+            guard await WindowControl.focus(target, click: true) else {
+                // Window closed or on another Space: don't paste into whatever is in front.
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(u.text, forType: .string)
+                return false
+            }
             focusedTarget = target.id
             try? await Task.sleep(nanoseconds: 120_000_000)
         }
-        await Input.paste(u.text, submit: Settings.autoSubmit)
+        await Input.paste(text, submit: submit)
         // You've moved on to another target while this was transcribing — hop back.
         if let back = returnTo, back.id != target.id {
             try? await Task.sleep(nanoseconds: 150_000_000)
             await WindowControl.focus(back, click: true)
             focusedTarget = back.id
         }
+        return true
     }
 
     private func appendHistory(_ u: Utterance) {
