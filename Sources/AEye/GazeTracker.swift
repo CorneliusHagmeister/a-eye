@@ -14,6 +14,10 @@ struct GazeSample {
     var pupilX: Double = 0
     var pupilY: Double = 0
     var hasEyes = false
+    /// Learned gaze model's estimate (degrees), when enabled and installed.
+    var learnedYaw: Double = 0
+    var learnedPitch: Double = 0
+    var hasLearned = false
     var time: CFTimeInterval
 }
 
@@ -35,6 +39,19 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     private let landmarks = VNDetectFaceLandmarksRequest()
     private var pupilX: Double?
     private var pupilY: Double?
+    private var learnedYaw: Double?
+    private var learnedPitch: Double?
+    /// Optional learned gaze model (MobileOne-S0) run on the face crop; nil = off/not installed.
+    private var learnedRequest: VNCoreMLRequest?
+
+    /// Loads (or unloads) the learned gaze model. Safe to call any time.
+    func setLearnedGaze(_ on: Bool) {
+        queue.async { [self] in
+            learnedRequest = on ? LearnedGaze.request() : nil
+            learnedYaw = nil; learnedPitch = nil
+            Log.info("gaze: learned model \(learnedRequest == nil ? "off" : "on")")
+        }
+    }
     private let handler = VNSequenceRequestHandler()
     private var device: AVCaptureDevice?
     private var yaw: Double?
@@ -122,8 +139,19 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
                 pupilX = pupilX.map { $0 + a * (p.x - $0) } ?? p.x
                 pupilY = pupilY.map { $0 + a * (p.y - $0) } ?? p.y
             }  // blink / eyes not found: hold the last pupil values
+            if let lr = learnedRequest {
+                lr.regionOfInterest = LearnedGaze.crop(face.boundingBox, width: size.width, height: size.height)
+                try? handler.perform([lr], on: px, orientation: .up)
+                if let v = (lr.results?.first as? VNCoreMLFeatureValueObservation)?.featureValue.multiArrayValue, v.count >= 2 {
+                    let ly = v[0].doubleValue, lp = v[1].doubleValue
+                    learnedYaw = learnedYaw.map { $0 + a * (ly - $0) } ?? ly
+                    learnedPitch = learnedPitch.map { $0 + a * (lp - $0) } ?? lp
+                }
+            }
             sample = GazeSample(yaw: yaw!, pitch: pitch!, faceX: faceX!, faceY: faceY!, faceSize: faceSize!,
-                                pupilX: pupilX ?? 0, pupilY: pupilY ?? 0, hasEyes: pupilX != nil, time: now)
+                                pupilX: pupilX ?? 0, pupilY: pupilY ?? 0, hasEyes: pupilX != nil,
+                                learnedYaw: learnedYaw ?? 0, learnedPitch: learnedPitch ?? 0,
+                                hasLearned: learnedRequest != nil && learnedYaw != nil, time: now)
         }
         frameTap?(px, request.results?.max(by: { $0.boundingBox.width < $1.boundingBox.width })?.boundingBox, sample)
         DispatchQueue.main.async { [self] in

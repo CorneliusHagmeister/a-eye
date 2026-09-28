@@ -66,6 +66,11 @@ enum Settings {
         get { d.string(forKey: "cleanupModel") ?? "gpt-6-luna" }
         set { d.set(newValue, forKey: "cleanupModel") }
     }
+    /// Use the learned gaze model (if installed) alongside head pose and pupils.
+    static var learnedGaze: Bool {
+        get { d.object(forKey: "learnedGaze") as? Bool ?? true }
+        set { d.set(newValue, forKey: "learnedGaze") }
+    }
     static var showGazePointer: Bool {
         get { d.bool(forKey: "showGazePointer") }
         set { d.set(newValue, forKey: "showGazePointer") }

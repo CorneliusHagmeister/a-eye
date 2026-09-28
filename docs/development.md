@@ -112,6 +112,7 @@ open -W -n dist/A-EYE.app --args <hook> [args…]
 | `--gaze-fit-test --postures` | Averages 20 fits of "one lean pass" vs "three postures", tested between, beyond and beside the calibrated postures | Posture-robustness trade-offs, *in simulation* |
 | `--commands-test` | Runs sample sentences through `Cleanup.basic` and `VoiceCommands.interpret` | Command parsing and filler removal (including false positives such as "umbrella") |
 | `--cleanup-test` | Sends 4 sample dictations (EN, DE, a self-correction, a question) through the rolling `Cleanup.rewrite` and logs latency and output | The OpenAI key, model name, latency, and that it cleans without answering |
+| `--learned-test [recording]` | Runs the app's learned-gaze path (compile, Vision crop, Core ML) on every 25th recorded frame and logs yaw/pitch | The installed Core ML model loads and matches the Python reference (compare with `tools/eval_gaze.py`'s ONNX model) |
 | `--refit` | Refits the gaze model from the saved raw calibration samples and saves it | Picks up changes to the fitting code without recalibrating |
 | `--clipboard-test` | Offers text via a promised pasteboard item (no ⌘V) and logs if and when another process reads it within 8 s, then restores the clipboard | The promise mechanism. Paste manually (⌘V) in any app while it runs. |
 | `--pupil-test` | Six dots on the built-in display. You keep your head still and follow them with your eyes. Logs pupil offset vs head yaw/pitch per dot, the separation in σ, and Vision landmark cost per frame | Whether pupil landmarks carry signal on this camera and face (real data) |
@@ -182,3 +183,16 @@ These are collected from the commit history. Each cost at least one debugging se
   giving up.
 - **The menu-bar icon can hide behind the notch** when the menu bar is crowded. Reopening
   the app pops the menu at the mouse.
+
+
+### Learned gaze model
+
+```bash
+tools/.venv/bin/pip install torch coremltools pillow
+curl -L -o tools/weights/mobileone_s0.pt https://github.com/yakhyo/gaze-estimation/releases/download/weights/mobileone_s0.pt
+curl -L -o tools/weights/mobileone_s0_gaze.onnx https://github.com/yakhyo/gaze-estimation/releases/download/weights/mobileone_s0_gaze.onnx
+tools/.venv/bin/python tools/convert_gaze_coreml.py   # installs GazeMobileOne.mlpackage, checks parity vs ONNX
+```
+
+The model architecture is vendored in `tools/third_party/gaze_estimation/` (MIT). Weights are
+Gaze360-trained: research / non-commercial only.

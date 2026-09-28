@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Vision
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let tracker = GazeTracker()
@@ -52,6 +53,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if CommandLine.arguments.contains("--inspect") { runInspect(); return }
         if CommandLine.arguments.contains("--gaze-fit-test") { runGazeFitTest(); return }
         if CommandLine.arguments.contains("--refit") { runRefit(); return }
+        if let i = CommandLine.arguments.firstIndex(of: "--learned-test") {
+            runLearnedTest(i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : nil); return
+        }
         if CommandLine.arguments.contains("--commands-test") { runCommandsTest(); return }
         if CommandLine.arguments.contains("--cleanup-test") { runCleanupTest(); return }
         if CommandLine.arguments.contains("--clipboard-test") { runClipboardTest(); return }
@@ -79,6 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wirePushToTalk()
         wireDispatcher()
         requestPermissions()
+        tracker.setLearnedGaze(Settings.learnedGaze && LearnedGaze.isInstalled)
     }
 
     /// Opening the app again (Finder, Spotlight, `open`) pops the menu at the mouse — the
@@ -668,6 +673,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item("Add a posture (e.g. leaning back)…", #selector(addPosture)))
             menu.addItem(item("Record gaze test set (3 min, saves frames)…", #selector(recordGazeSet)))
             menu.addItem(item("Show gaze pointer", #selector(togglePointer), on: Settings.showGazePointer))
+            menu.addItem(LearnedGaze.isInstalled
+                ? item("Learned gaze model (MobileOne · research weights)", #selector(toggleLearned), on: Settings.learnedGaze)
+                : item("Learned gaze model — not installed (tools/convert_gaze_coreml.py)", nil))
             menu.addItem(item("Forget screen calibration (use pinned targets)", #selector(forgetScreenCalibration)))
         }
         if !AX.isTrusted { menu.addItem(item("⚠︎ Grant Accessibility…", #selector(openAXSettings))) }
@@ -749,6 +757,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Log.info("recording gaze test set to \(rec.dir.path)")
     }
     @objc private func addPosture() { guard !screenCal.isRunning else { return }; pointer.hide(); screenCal.start(addPosture: true) }
+    @objc private func toggleLearned() {
+        Settings.learnedGaze.toggle()
+        tracker.setLearnedGaze(Settings.learnedGaze && LearnedGaze.isInstalled)
+        // Refit from the saved calibration samples with or without the learned inputs.
+        if let m = GazeModel.fit(CalibrationData.load(), useLearned: Settings.learnedGaze) {
+            m.save(); gazeModel = m; gazePoint = nil
+            let note = Settings.learnedGaze && !m.usesLearned ? " — recalibrate to include it" : ""
+            hud.show("Learned gaze \(Settings.learnedGaze ? "on" : "off") · ±\(Int(m.errorPx))px\(note)", hideAfter: 3)
+        }
+    }
     @objc private func togglePointer() { Settings.showGazePointer.toggle(); if !Settings.showGazePointer { pointer.hide() } }
     @objc private func forgetScreenCalibration() {
         try? FileManager.default.removeItem(at: Paths.gazeModel)
@@ -861,6 +879,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: CLI test hooks
+
+    /// `AEye --learned-test [recording]` — runs the app's learned-gaze path (compile, Vision
+    /// crop, Core ML) on every 25th recorded frame and logs yaw/pitch per file, for comparison
+    /// with the Python/ONNX reference.
+    private func runLearnedTest(_ dir: String?) {
+        let rec = dir.map { URL(fileURLWithPath: $0) } ?? (try? FileManager.default.contentsOfDirectory(
+            at: Paths.support.appendingPathComponent("gaze-recordings"), includingPropertiesForKeys: nil))?
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }.last
+        guard let rec, let text = try? String(contentsOf: rec.appendingPathComponent("frames.jsonl")),
+              let req = LearnedGaze.request() else { Log.info("learned-test: no recording or model"); exit(1) }
+        let rows = text.split(separator: "\n").compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+        let t0 = Date()
+        var n = 0
+        for (i, r) in rows.enumerated() where i % 25 == 0 {
+            guard let file = r["file"] as? String, let b = r["bbox"] as? [Double], let w = r["w"] as? Double, let h = r["h"] as? Double else { continue }
+            req.regionOfInterest = LearnedGaze.crop(CGRect(x: b[0], y: b[1], width: b[2], height: b[3]), width: w, height: h)
+            try? VNImageRequestHandler(url: rec.appendingPathComponent(file), options: [:]).perform([req])
+            if let v = (req.results?.first as? VNCoreMLFeatureValueObservation)?.featureValue.multiArrayValue {
+                Log.info(String(format: "learned-test %@ %.2f %.2f", file, v[0].doubleValue, v[1].doubleValue)); n += 1
+            }
+        }
+        Log.info(String(format: "learned-test: %d frames, %.1f ms/frame incl. JPEG decode", n, Date().timeIntervalSince(t0) * 1000 / Double(max(n, 1))))
+        exit(0)
+    }
 
     /// `AEye --refit` — refits the gaze model from the saved raw calibration samples (e.g. after
     /// a change to the fitting code) and saves it; logs the result next to head-only.

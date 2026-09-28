@@ -41,6 +41,7 @@ final class GazeRecorder {
             "file": name, "step": cur.step, "label": cur.label, "dotX": cur.dot.x, "dotY": cur.dot.y,
             "yaw": s.yaw, "pitch": s.pitch, "faceX": s.faceX, "faceY": s.faceY, "faceSize": s.faceSize,
             "pupilX": s.pupilX, "pupilY": s.pupilY, "hasEyes": s.hasEyes,
+            "learnedYaw": s.learnedYaw, "learnedPitch": s.learnedPitch, "hasLearned": s.hasLearned,
             "bbox": [face.minX, face.minY, face.width, face.height],  // Vision: normalised, origin bottom-left
             "w": CVPixelBufferGetWidth(px), "h": CVPixelBufferGetHeight(px),
         ]

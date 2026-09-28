@@ -177,3 +177,34 @@ optimistic.
 tools/.venv/bin/python tools/eval_gaze.py                       # latest recording
 tools/.venv/bin/python tools/eval_gaze.py ~/Library/Application\ Support/A-EYE/gaze-recordings/<stamp>
 ```
+
+
+## Learned gaze model (optional)
+
+A-EYE can add a learned appearance-based gaze estimate as two more inputs to the geometric
+model: **MobileOne-S0** from [yakhyo/gaze-estimation](https://github.com/yakhyo/gaze-estimation)
+(MIT code, **Gaze360-trained weights: research / non-commercial use only** — so it is not
+bundled). `tools/convert_gaze_coreml.py` converts it to Core ML with normalisation and the
+90-bin decode built in and installs it at
+`~/Library/Application Support/A-EYE/models/GazeMobileOne.mlpackage`; the app compiles it on
+first use, runs it on the face crop via Vision (~6 ms/frame, Neural Engine) and exposes
+menu › *Learned gaze model*. Toggling refits from the saved calibration samples; samples from
+before the model was installed have no learned values, so recalibrate once to use it.
+
+The learned angles enter like the pupils: relative to their calibration mean, projected with
+the distance (`hz · tan(angle)`), weights learned per user by the calibration fit.
+
+**Real data** (recorded test set, 646 frames / 72 dots, `tools/eval_gaze.py`, leave-one-dot-out):
+
+| Inputs | Error | Held out: eyes only · head only · leaned back a little · leaned right back · sitting straight |
+|---|---|---|
+| head only | 426 px | 448 · 365 · 284 · 587 · 421 |
+| head + pupils | 234 px | 230 · 141 · 221 · 489 · 236 |
+| MobileOne-S0 alone | 281 px | 274 · 168 · 290 · 586 · 278 |
+| **head + pupils + MobileOne-S0** | **168 px** | 166 · 104 · 151 · 333 · 179 |
+| head + pupils + ResNet-50 / MobileNetV2 | 197 / 196 px | — |
+
+Same session for calibration and test, one person, one lighting setup. Conversion parity:
+Core ML vs ONNX on identical crops ±0.3° (fp16); the app's Vision crop/scale path vs the
+Python OpenCV crop differs by ~2–3° mean (max ~7.5°), so in-app results may differ somewhat
+from the offline table — calibration and runtime share the in-app path, so they stay consistent.

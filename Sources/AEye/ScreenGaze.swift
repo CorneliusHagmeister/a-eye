@@ -9,7 +9,8 @@ import AppKit
 /// leaning back or shifting sideways moves the estimate the way it physically should.
 /// On top of that, the pupils' position inside the eyes adds the eyes' own contribution
 /// (scaled by distance — the same eye turn covers more screen from further away), so a glance
-/// without turning your head still moves the estimate.
+/// without turning your head still moves the estimate. Optionally a learned gaze model
+/// (MobileOne-S0 on the face crop) adds its own yaw/pitch estimate as two more inputs.
 struct GazeModel: Codable {
     var gx: Double
     var gy: Double
@@ -26,6 +27,10 @@ struct GazeModel: Codable {
     /// Distances (model units) the calibration covered; outside this, suggest adding a posture.
     var hzMin: Double
     var hzMax: Double
+    /// Learned-gaze terms in use (optional so models saved before they existed still load).
+    var learned: Bool?
+    var meanLearnedYaw: Double?
+    var meanLearnedPitch: Double?
 
     // Rough FaceTime-camera field of view (tan of half-angles); independent of the capture
     // preset since face position and size are normalised.
@@ -52,7 +57,8 @@ struct GazeModel: Codable {
     }
 
     static func features(_ s: GazeSample, gx: Double, gy: Double, quadratic: Bool,
-                         eyes: Bool, meanPupil: (Double, Double)) -> [Double] {
+                         eyes: Bool, meanPupil: (Double, Double),
+                         learned: Bool = false, meanLearned: (Double, Double) = (0, 0)) -> [Double] {
         let (u, v) = plane(s, gx: gx, gy: gy)
         var f = quadratic ? [1, u, v, u * u, v * v, u * v] : [1, u, v]
         if eyes {
@@ -62,13 +68,22 @@ struct GazeModel: Codable {
             let px = s.hasEyes ? s.pupilX - meanPupil.0 : 0, py = s.hasEyes ? s.pupilY - meanPupil.1 : 0
             f += [hz * px * 10, hz * py * 10]  // ×10: similar scale to u, v
         }
+        if learned {
+            // The learned model's own gaze angles, relative to their calibration average and
+            // projected like the head ray. Missing (model off) → contributes nothing.
+            let hz = distance(s)
+            let ly = s.hasLearned ? s.learnedYaw - meanLearned.0 : 0, lp = s.hasLearned ? s.learnedPitch - meanLearned.1 : 0
+            f += [hz * tan(ly * .pi / 180), hz * tan(lp * .pi / 180)]
+        }
         return f
     }
 
-    var quadratic: Bool { cx.count - (eyes ? 2 : 0) > 3 }
+    var usesLearned: Bool { learned == true }
+    var quadratic: Bool { cx.count - (eyes ? 2 : 0) - (usesLearned ? 2 : 0) > 3 }
 
     func predict(_ s: GazeSample) -> CGPoint {
-        let f = Self.features(s, gx: gx, gy: gy, quadratic: quadratic, eyes: eyes, meanPupil: (meanPupilX, meanPupilY))
+        let f = Self.features(s, gx: gx, gy: gy, quadratic: quadratic, eyes: eyes, meanPupil: (meanPupilX, meanPupilY),
+                              learned: usesLearned, meanLearned: (meanLearnedYaw ?? 0, meanLearnedPitch ?? 0))
         return CGPoint(x: zip(f, cx).map(*).reduce(0, +), y: zip(f, cy).map(*).reduce(0, +))
     }
 
@@ -79,13 +94,17 @@ struct GazeModel: Codable {
 
     /// Grid-searches the eye gain per axis (with a mild prior at 1.3 — from one posture it's
     /// barely identifiable) and fits the plane→screen mapping by least squares for each.
-    static func fit(_ data: [(GazeSample, CGPoint)], useEyes: Bool = true) -> GazeModel? {
+    static func fit(_ data: [(GazeSample, CGPoint)], useEyes: Bool = true, useLearned: Bool = true) -> GazeModel? {
         guard data.count >= 5 else { return nil }
         let withEyes = data.filter { $0.0.hasEyes }
         let eyes = useEyes && Double(withEyes.count) >= 0.8 * Double(data.count) && data.count >= 10
         let meanPupil = (withEyes.map(\.0.pupilX).reduce(0, +) / Double(max(withEyes.count, 1)),
                          withEyes.map(\.0.pupilY).reduce(0, +) / Double(max(withEyes.count, 1)))
-        let quadratic = data.count >= (eyes ? 16 : 12)
+        let withLearned = data.filter { $0.0.hasLearned }
+        let learned = useLearned && Double(withLearned.count) >= 0.8 * Double(data.count) && data.count >= 10
+        let meanLearned = (withLearned.map(\.0.learnedYaw).reduce(0, +) / Double(max(withLearned.count, 1)),
+                           withLearned.map(\.0.learnedPitch).reduce(0, +) / Double(max(withLearned.count, 1)))
+        let quadratic = data.count >= 12 + (eyes ? 4 : 0) + (learned ? 4 : 0)
         // Wide range: a real calibration hit both edges of 0.6…2.4.
         let gains = stride(from: 0.3, through: 3.0, by: 0.1).map { $0 }
         // Head gain prior: without eye data the head has to account for the eyes too (~1.3);
@@ -94,7 +113,8 @@ struct GazeModel: Codable {
         let prior = 3000.0 * Double(data.count)  // px² per unit² of gain away from the centre
         var best: (gx: Double, gy: Double, cx: [Double], cy: [Double], cost: Double)?
         for gx in gains { for gy in gains {
-            let X = data.map { features($0.0, gx: gx, gy: gy, quadratic: quadratic, eyes: eyes, meanPupil: meanPupil) }
+            let X = data.map { features($0.0, gx: gx, gy: gy, quadratic: quadratic, eyes: eyes, meanPupil: meanPupil,
+                                        learned: learned, meanLearned: meanLearned) }
             let tx = data.map { Double($0.1.x) }, ty = data.map { Double($0.1.y) }
             guard let cx = solve(X, tx), let cy = solve(X, ty) else { continue }
             var sse = 0.0
@@ -113,10 +133,12 @@ struct GazeModel: Codable {
         for key in Set(data.map { dotKey($0.1) }) {
             let rest = data.filter { dotKey($0.1) != key }
             let held = data.filter { dotKey($0.1) == key }
-            let X = rest.map { features($0.0, gx: b.gx, gy: b.gy, quadratic: quadratic, eyes: eyes, meanPupil: meanPupil) }
+            let X = rest.map { features($0.0, gx: b.gx, gy: b.gy, quadratic: quadratic, eyes: eyes, meanPupil: meanPupil,
+                                        learned: learned, meanLearned: meanLearned) }
             guard let ax = solve(X, rest.map { Double($0.1.x) }), let ay = solve(X, rest.map { Double($0.1.y) }) else { continue }
             let m = GazeModel(gx: b.gx, gy: b.gy, eyes: eyes, meanPupilX: meanPupil.0, meanPupilY: meanPupil.1,
-                              cx: ax, cy: ay, errorPx: 0, points: 0, hzMin: 0, hzMax: 0)
+                              cx: ax, cy: ay, errorPx: 0, points: 0, hzMin: 0, hzMax: 0,
+                              learned: learned, meanLearnedYaw: meanLearned.0, meanLearnedPitch: meanLearned.1)
             for (s, target) in held {
                 let p = m.predict(s)
                 errors.append(hypot(p.x - target.x, p.y - target.y))
@@ -126,7 +148,8 @@ struct GazeModel: Codable {
         let hz = data.map { distance($0.0) }
         return GazeModel(gx: b.gx, gy: b.gy, eyes: eyes, meanPupilX: meanPupil.0, meanPupilY: meanPupil.1, cx: b.cx, cy: b.cy,
                          errorPx: errors.isEmpty ? 0 : errors[errors.count / 2], points: data.count,
-                         hzMin: hz.min() ?? 1, hzMax: hz.max() ?? 1)
+                         hzMin: hz.min() ?? 1, hzMax: hz.max() ?? 1,
+                         learned: learned, meanLearnedYaw: meanLearned.0, meanLearnedPitch: meanLearned.1)
     }
 
     private static func solve(_ X: [[Double]], _ y: [Double], lambda: Double = 1e-6) -> [Double]? {
@@ -156,6 +179,7 @@ enum CalibrationData {
     struct Point: Codable {
         var yaw, pitch, faceX, faceY, faceSize, x, y: Double
         var pupilX, pupilY: Double?
+        var learnedYaw, learnedPitch: Double?
     }
 
     static func load() -> [(GazeSample, CGPoint)] {
@@ -163,13 +187,17 @@ enum CalibrationData {
               let pts = try? JSONDecoder().decode([Point].self, from: d) else { return [] }
         return pts.map { (GazeSample(yaw: $0.yaw, pitch: $0.pitch, faceX: $0.faceX, faceY: $0.faceY,
                                      faceSize: $0.faceSize, pupilX: $0.pupilX ?? 0, pupilY: $0.pupilY ?? 0,
-                                     hasEyes: $0.pupilX != nil, time: 0), CGPoint(x: $0.x, y: $0.y)) }
+                                     hasEyes: $0.pupilX != nil, learnedYaw: $0.learnedYaw ?? 0,
+                                     learnedPitch: $0.learnedPitch ?? 0, hasLearned: $0.learnedYaw != nil,
+                                     time: 0), CGPoint(x: $0.x, y: $0.y)) }
     }
 
     static func save(_ data: [(GazeSample, CGPoint)]) {
         let pts = data.map { Point(yaw: $0.0.yaw, pitch: $0.0.pitch, faceX: $0.0.faceX, faceY: $0.0.faceY,
                                    faceSize: $0.0.faceSize, x: Double($0.1.x), y: Double($0.1.y),
-                                   pupilX: $0.0.hasEyes ? $0.0.pupilX : nil, pupilY: $0.0.hasEyes ? $0.0.pupilY : nil) }
+                                   pupilX: $0.0.hasEyes ? $0.0.pupilX : nil, pupilY: $0.0.hasEyes ? $0.0.pupilY : nil,
+                                   learnedYaw: $0.0.hasLearned ? $0.0.learnedYaw : nil,
+                                   learnedPitch: $0.0.hasLearned ? $0.0.learnedPitch : nil) }
         try? JSONEncoder().encode(pts).write(to: Paths.gazeCalibration)
     }
 }
@@ -330,10 +358,11 @@ final class ScreenCalibrator {
         func m(_ k: KeyPath<GazeSample, Double>, _ from: [GazeSample]) -> Double {
             let v = from.map { $0[keyPath: k] }.sorted(); return v.isEmpty ? 0 : v[v.count / 2]
         }
-        let eyed = s.filter(\.hasEyes)
+        let eyed = s.filter(\.hasEyes), learnt = s.filter(\.hasLearned)
         return GazeSample(yaw: m(\.yaw, s), pitch: m(\.pitch, s), faceX: m(\.faceX, s), faceY: m(\.faceY, s),
                           faceSize: m(\.faceSize, s), pupilX: m(\.pupilX, eyed), pupilY: m(\.pupilY, eyed),
-                          hasEyes: eyed.count * 2 >= s.count, time: 0)
+                          hasEyes: eyed.count * 2 >= s.count, learnedYaw: m(\.learnedYaw, learnt),
+                          learnedPitch: m(\.learnedPitch, learnt), hasLearned: learnt.count * 2 >= s.count, time: 0)
     }
 
     private func finish() {
@@ -343,9 +372,12 @@ final class ScreenCalibrator {
         let all = appending ? CalibrationData.load() + data : data
         let model = GazeModel.fit(all)
         if let model { model.save(); CalibrationData.save(all) }
-        Log.info("calibration: \(data.count) new / \(all.count) total points, model \(model.map { String(format: "±%.0fpx eyes %@ gains %.1f/%.1f distance %.2f–%.2f", $0.errorPx, $0.eyes ? "on" : "off", $0.gx, $0.gy, $0.hzMin, $0.hzMax) } ?? "failed")")
+        Log.info("calibration: \(data.count) new / \(all.count) total points, model \(model.map { String(format: "±%.0fpx eyes %@ learned %@ gains %.1f/%.1f distance %.2f–%.2f", $0.errorPx, $0.eyes ? "on" : "off", $0.usesLearned ? "on" : "off", $0.gx, $0.gy, $0.hzMin, $0.hzMax) } ?? "failed")")
+        if model?.usesLearned == true, let noLearned = GazeModel.fit(all, useLearned: false) {
+            Log.info(String(format: "calibration: without the learned model it would be ±%.0fpx", noLearned.errorPx))
+        }
         var headOnlyPx: Double?
-        if model?.eyes == true, let headOnly = GazeModel.fit(all, useEyes: false) {
+        if model?.eyes == true, let headOnly = GazeModel.fit(all, useEyes: false, useLearned: false) {
             headOnlyPx = headOnly.errorPx
             Log.info(String(format: "calibration: head-only would be ±%.0fpx", headOnly.errorPx))
         }
