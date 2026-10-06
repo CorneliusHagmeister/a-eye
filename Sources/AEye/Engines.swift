@@ -33,7 +33,7 @@ extension SpeechEngine {
     var needsKey: Bool { false }
     func prepare() {}
     func shutdown() {}
-    var hasKey: Bool { !needsKey || Keychain.get(id) != nil }
+    var hasKey: Bool { !needsKey || Keychain.has(id) }
 }
 
 protocol SpeechSession: AnyObject {

@@ -238,7 +238,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if case .none = calMode {} else { beginCapture(); return }
         if screenCal.isRunning { return }
         latchedRect = nil
-        if gazeModel != nil {
+        if !tracker.isRunning {
+            latched = nil  // camera paused: plain dictation into the focused input
+        } else if gazeModel != nil {
             latched = nil
             if let g = gazePoint, let (t, rect) = screenTarget(at: g) { latched = t; latchedRect = rect; highlight.show(rect) }
             if let s = tracker.latest, gazeModel!.isOutsideCalibratedPosture(s), Date().timeIntervalSince(lastPostureHint) > 300 {
@@ -718,7 +720,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let csub = NSMenu()
         csub.addItem(item("Off — exactly as heard", #selector(chooseCleanup(_:)), "off", on: Settings.cleanup == "off"))
         csub.addItem(item("Basic — remove fillers (local)", #selector(chooseCleanup(_:)), "basic", on: Settings.cleanup == "basic"))
-        csub.addItem(item("OpenAI \(Settings.cleanupModel)\(Keychain.get("openai") == nil ? " — add API key…" : "")",
+        csub.addItem(item("OpenAI \(Settings.cleanupModel)\(!Keychain.has("openai") ? " — add API key…" : "")",
                           #selector(chooseCleanup(_:)), "openai", on: Settings.cleanup == "openai"))
         let names = ["off": "off", "basic": "basic", "openai": "OpenAI"]
         let ci = item("Clean-up: \(names[Settings.cleanup] ?? Settings.cleanup)", nil); ci.submenu = csub
@@ -736,7 +738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         esub.addItem(.separator())
         for (id, name) in Engines.catalog where Engines.make(id)?.needsKey == true {
-            esub.addItem(item("\(Keychain.get(id) == nil ? "Add" : "Change") \(name) API key…", #selector(editKey(_:)), id))
+            esub.addItem(item("\(!Keychain.has(id) ? "Add" : "Change") \(name) API key…", #selector(editKey(_:)), id))
         }
         let ei = item("Engine: \(engine.name)", nil); ei.submenu = esub
         menu.addItem(ei)
@@ -781,7 +783,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func togglePasteWhileSpeaking() { Settings.pasteWhileSpeaking.toggle() }
     @objc private func chooseCleanup(_ s: NSMenuItem) {
         guard let mode = s.representedObject as? String else { return }
-        if mode == "openai", Keychain.get("openai") == nil, !promptForKey("openai") { return }
+        if mode == "openai", !Keychain.has("openai"), !promptForKey("openai") { return }
         Settings.cleanup = mode
     }
     @objc private func toggleMenuBar() { Settings.showGazeInMenuBar.toggle(); updateStatusTitle(face: tracker.latest != nil) }
@@ -827,7 +829,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Use key from clipboard")
         alert.addButton(withTitle: "Cancel")
-        if Keychain.get(id) != nil { alert.addButton(withTitle: "Remove key") }
+        if Keychain.has(id) { alert.addButton(withTitle: "Remove key") }
         alert.window.initialFirstResponder = field
         func save(_ raw: String?) -> Bool {
             let key = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -848,11 +850,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             hud.show("\(name) key removed", hideAfter: 2)
             return false
         default:
-            return Keychain.get(id) != nil
+            return Keychain.has(id)
         }
     }
     @objc private func toggleCamera() {
-        tracker.isRunning ? tracker.stop() : tracker.start()
+        if tracker.isRunning {
+            tracker.stop()
+            gazePoint = nil  // a stale gaze point would keep routing to the last target
+            pointer.hide()
+        } else {
+            tracker.start()
+        }
         updateStatusTitle(face: false)
     }
     @objc private func openRecordings() { NSWorkspace.shared.open(Paths.recordings) }
