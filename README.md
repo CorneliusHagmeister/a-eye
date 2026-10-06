@@ -56,6 +56,7 @@ The Parakeet model downloads the first time you press the key.
 |---|---|
 | **Talk** | Hold Right ⌥ (≥0.25 s). A shorter tap, Esc, or any other key within 0.4 s of pressing (for example ⌥3 for `#`) cancels. |
 | **Target** | Latched at key-down. For the first 0.4 s it can still re-latch while your head finishes turning. |
+| **No gaze** | menu › *Pause camera* turns routing off: the text goes into whichever input has focus (Slack, a browser, a password-free form…). |
 | **"scratch that"** | On its own, it removes the last text A-EYE pasted into that input. Mid-sentence, it drops the sentence before it. |
 | **"clear the input"** | On its own or leading a sentence, it empties the input with ⌘A ⌫. It only works on a detected text input, never an editor. |
 | **"…, send it"** | Trailing only. Presses Return once the text (and any clean-up) is in. |
@@ -76,7 +77,8 @@ The Parakeet model downloads the first time you press the key.
 - **Stored locally:** every press is saved as a WAV in `…/A-EYE/recordings/`, and the text
   of every press is appended to `…/A-EYE/history.jsonl`. Neither is pruned automatically.
 - **API keys** are kept in the login Keychain (service `dev.gazevoice.api-keys`). Each key
-  is only sent to its own provider.
+  is only sent to its own provider. The menu only checks whether a key exists, so after a rebuild macOS asks
+  for Keychain access only when an engine actually uses a key.
 
 ## Docs
 
